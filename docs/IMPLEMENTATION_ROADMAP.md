@@ -96,9 +96,14 @@ the simulator:
 | --- | --- | --- |
 | Token bucket for the trading API | the current design relies on cadence, not on an explicit budget | multi-symbol use could hit 429s |
 | Multi-symbol risk tuning | limits are calibrated for one symbol at 25% | a basket would breach `max_total_exposure_pct` unpredictably |
-| Fee-currency accounting | fees on buys are charged in the base asset; the ledger records quote-currency fees | small, bounded basis drift on buys (`docs/API_CAPABILITIES.md` §4) |
 | `stop_limit` support | requires a `stop_price` field on `OrderIntent` and its own tests | none today; it is simply unsupported |
 | Prometheus/structured metrics export | operators currently read text and SQLite | none for a single-operator setup |
+
+Removed from this table on 2026-10-29: fee-currency accounting. It was a real
+defect rather than a limitation, and it is fixed — a buy's fee is recorded in the
+base asset, the credited quantity is netted, and the broker's posted `CFEE`/`FEE`
+activity corrects the estimate. See `docs/API_CAPABILITIES.md` §4 and
+`tests/test_fees.py`.
 
 Each of these needs its own checklist entry with evidence before it is believed.
 None of them should be merged into the running soak's code path mid-flight.
@@ -117,7 +122,8 @@ None of them should be merged into the running soak's code path mid-flight.
 
 The project is complete when all of the following are true:
 
-1. `pytest` is green. *(true today: 373 passed)*
+1. `pytest` is green. *(true today: 501 passed in `.venv`, 468 passed + 1 skipped
+   without `alpaca-py`)*
 2. `cryptobot preflight --mode paper` reports no failures against a real paper
    account. *(not yet run)*
 3. A paper soak of at least 30 days has run with no critical reconciliation
@@ -136,8 +142,9 @@ traded.**
 Before claiming any change is complete:
 
 ```powershell
-python -m pytest tests -p no:cacheprovider --tb=short -rN     # expect 373+ passed
+python -m pytest                                              # expect 501 passed
 cryptobot config-check                                        # no secrets, paper only
+cryptobot env-hint                                            # variable names, never values
 cryptobot preflight --mode simulated                          # failures? warnings are fine
 cryptobot run-once                                            # decisions recorded, no orders
 ```

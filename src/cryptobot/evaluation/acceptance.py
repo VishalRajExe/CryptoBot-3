@@ -18,6 +18,11 @@ Duration is reported separately as ``pending`` rather than as a failure: on day
 three the project is not broken, it is simply not finished. Every other
 criterion that fails is a real failure. The report never claims readiness it
 cannot evidence.
+
+Duration is measured from soak heartbeats, not from the wall clock. A journal
+whose first decision is thirty days old proves that the bot *once* ran; it does
+not prove that it ran for thirty days. ``cryptobot.soak`` supplies the covered
+interval, and time during which the process was not running counts as zero.
 """
 
 from __future__ import annotations
@@ -33,10 +38,10 @@ from cryptobot.core.states import SystemState
 from cryptobot.evaluation.trades import evaluate_execution, evaluate_trades
 from cryptobot.journal.store import Journal
 from cryptobot.sizing.ledger import AllocationLedger
+from cryptobot.soak import SoakCoverage, compute_coverage
 
 ZERO = Decimal("0")
 UTC = timezone.utc
-SECONDS_PER_DAY = Decimal("86400")
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,10 @@ class AcceptanceCriteria:
     max_critical_drifts: int = 0
     max_unresolved_orders: int = 0
     max_average_slippage_bps: Decimal = Decimal("50")
+    #: Gaps longer than the heartbeat threshold. Zero means the soak must be
+    #: continuous; a single outage is a finding, not a rounding error.
+    max_gaps: int = 0
+    max_restarts: int = 10
 
     def __post_init__(self) -> None:
         if self.required_days <= ZERO:
@@ -62,6 +71,8 @@ class AcceptanceCriteria:
             "min_reconciliations",
             "max_critical_drifts",
             "max_unresolved_orders",
+            "max_gaps",
+            "max_restarts",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} cannot be negative")
@@ -89,6 +100,9 @@ class AcceptanceReport:
     generated_at: datetime
     state: SystemState = SystemState.ACTIVE
     notes: tuple[str, ...] = field(default_factory=tuple)
+    covered_days: Decimal = ZERO
+    observed_days: Decimal = ZERO
+    coverage: SoakCoverage = field(default_factory=SoakCoverage)
 
     @property
     def ok(self) -> bool:
@@ -118,8 +132,13 @@ class AcceptanceReport:
             f"  generated        {self.generated_at.isoformat()}",
             f"  system state     {self.state.value}",
             f"  soak             {progress}",
-            "",
         ]
+        if self.observed_days != self.elapsed_days:
+            lines.append(
+                f"  observed         {self.observed_days:.1f} day(s) of wall clock; "
+                f"only {self.elapsed_days:.1f} day(s) evidenced by heartbeats"
+            )
+        lines.append("")
         lines.extend(criterion.line() for criterion in self.criteria)
         lines.append("")
         if self.ok:
@@ -142,6 +161,9 @@ class AcceptanceReport:
             "elapsed_days": str(self.elapsed_days.quantize(Decimal("0.01"))),
             "required_days": str(self.required_days),
             "remaining_days": str(self.remaining_days.quantize(Decimal("0.01"))),
+            "covered_days": str(self.covered_days.quantize(Decimal("0.01"))),
+            "observed_days": str(self.observed_days.quantize(Decimal("0.01"))),
+            "coverage": self.coverage.as_dict(),
             "criteria": [
                 {
                     "name": criterion.name,
@@ -178,9 +200,11 @@ def run_acceptance(
     health = journal.health()
     first, _last = journal.activity_span()
     days = journal.decision_days()
-    elapsed = (
-        Decimal(str((now - first).total_seconds())) / SECONDS_PER_DAY if first else ZERO
-    )
+
+    # Duration is coverage, not elapsed time. ``observed`` stays in the report so
+    # an operator can see how much wall clock the heartbeats fail to explain.
+    coverage = compute_coverage(journal, now=now)
+    elapsed = coverage.covered_days
 
     checks: list[Criterion] = []
 
@@ -198,9 +222,39 @@ def run_acceptance(
 
     checks.append(
         Criterion(
+            "soak_instrumented",
+            coverage.instrumented,
+            (
+                f"{coverage.checkpoints} heartbeat(s) across "
+                f"{coverage.processes} process(es)"
+                if coverage.window_id is not None
+                else "no soak window; run the bot with `cryptobot paper-run` to record one"
+            ),
+        )
+    )
+
+    checks.append(
+        Criterion(
+            "soak_continuity",
+            len(coverage.gaps) <= criteria.max_gaps,
+            f"{len(coverage.gaps)} gap(s) longer than "
+            f"{coverage.gap_threshold_seconds}s within budget {criteria.max_gaps}",
+        )
+    )
+
+    checks.append(
+        Criterion(
+            "restart_budget",
+            coverage.restarts <= criteria.max_restarts,
+            f"{coverage.restarts} restart(s) within budget {criteria.max_restarts}",
+        )
+    )
+
+    checks.append(
+        Criterion(
             "soak_duration",
             elapsed >= criteria.required_days,
-            f"{elapsed.quantize(Decimal('0.01'))} of {criteria.required_days} day(s)",
+            f"{elapsed.quantize(Decimal('0.01'))} of {criteria.required_days} day(s) covered",
             blocking=False,
         )
     )
@@ -313,6 +367,8 @@ def run_acceptance(
         )
     if execution.skipped:
         notes.append(f"{len(execution.skipped)} filled order(s) had no usable reference price")
+    if coverage.api_errors:
+        notes.append(f"{coverage.api_errors} API error(s) recorded during the soak")
 
     return AcceptanceReport(
         criteria=tuple(checks),
@@ -321,6 +377,9 @@ def run_acceptance(
         generated_at=now,
         state=state,
         notes=tuple(notes),
+        covered_days=coverage.covered_days,
+        observed_days=coverage.observed_days,
+        coverage=coverage,
     )
 
 

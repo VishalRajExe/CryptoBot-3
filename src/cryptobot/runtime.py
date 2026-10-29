@@ -47,6 +47,7 @@ from cryptobot.preflight import PreflightReport, run_preflight
 from cryptobot.reconciliation.reconciler import ReconciliationReport, Reconciler
 from cryptobot.risk.manager import RiskManager
 from cryptobot.sizing.ledger import AllocationLedger
+from cryptobot.soak import SoakRecorder
 from cryptobot.strategy.base import Strategy, build_strategy
 
 log = get_logger(__name__)
@@ -311,6 +312,7 @@ class TradingLoop:
         naplike: Callable[[float], None] = time.sleep,
         on_cycle: Callable[[CycleResult], None] | None = None,
         max_consecutive_errors: int = 3,
+        instrument_soak: bool = True,
     ) -> None:
         self.runtime = runtime
         self.submit = submit
@@ -320,6 +322,7 @@ class TradingLoop:
         self._sleep = naplike
         self._on_cycle = on_cycle
         self._max_errors = max(1, int(max_consecutive_errors))
+        self._instrument_soak = bool(instrument_soak)
         self._stop = False
         self._stop_reason = ""
 
@@ -361,64 +364,81 @@ class TradingLoop:
 
         runtime.capture_account()
 
-        while not self._stop:
-            if iterations is not None and report.cycles >= iterations:
-                report.stopped_reason = "iteration limit reached"
-                break
-            if stop_event is not None and stop_event():
-                report.stopped_reason = "stop event set"
-                break
+        # Soak evidence starts here, after preflight has proven the process is
+        # fit to run. A failed preflight must not look like soak time.
+        recorder: SoakRecorder | None = None
+        if self._instrument_soak:
+            recorder = SoakRecorder(
+                runtime.journal, interval_seconds=max(self.interval_seconds, 1.0)
+            )
+            recorder.start()
 
-            error: str | None = None
-            try:
-                if self.refresh:
-                    runtime.refresh_data()
-                runtime.sync_prices()
+        try:
+            while not self._stop:
+                if iterations is not None and report.cycles >= iterations:
+                    report.stopped_reason = "iteration limit reached"
+                    break
+                if stop_event is not None and stop_event():
+                    report.stopped_reason = "stop event set"
+                    break
 
-                state, reason, _ = runtime.journal.get_system_state()
-                if not Capabilities.for_state(state).allow_new_entries:
-                    log.info(
-                        "entries disabled; skipping evaluation",
-                        extra={"context": {"state": state.value, "reason": reason}},
-                    )
-                else:
-                    for result in runtime.engine.evaluate_all(submit=self.submit):
-                        report.results.append(result)
-                        if self._on_cycle is not None:
-                            self._on_cycle(result)
-
-                runtime.capture_account()
-                if report.cycles % self.reconcile_every == 0:
-                    report.reconciliations.append(runtime.reconcile(context="periodic"))
-            except KeyboardInterrupt:
-                report.stopped_reason = "interrupted"
-                self._stop = True
-                break
-            except Exception as exc:  # noqa: BLE001 - the loop must not die silently
-                error = f"{type(exc).__name__}: {exc}"
-                report.errors.append(error)
-                log.error("cycle failed", extra={"context": {"error": error[:300]}})
-
-            consecutive_errors = 0 if error is None else consecutive_errors + 1
-            if consecutive_errors >= self._max_errors:
-                runtime.set_state(
-                    SystemState.HALTED,
-                    f"{consecutive_errors} consecutive cycle errors; last: {error}",
-                )
-                report.stopped_reason = "halted after repeated errors"
-                self._notify(f"CRYPTOBOT halted after {consecutive_errors} cycle errors")
-                break
-
-            report.cycles += 1
-            if iterations is not None and report.cycles >= iterations:
-                continue
-            if self.interval_seconds > 0 and not self._stop:
+                error: str | None = None
                 try:
-                    self._sleep(self.interval_seconds)
+                    if self.refresh:
+                        runtime.refresh_data()
+                    runtime.sync_prices()
+
+                    state, reason, _ = runtime.journal.get_system_state()
+                    if not Capabilities.for_state(state).allow_new_entries:
+                        log.info(
+                            "entries disabled; skipping evaluation",
+                            extra={"context": {"state": state.value, "reason": reason}},
+                        )
+                    else:
+                        for result in runtime.engine.evaluate_all(submit=self.submit):
+                            report.results.append(result)
+                            if self._on_cycle is not None:
+                                self._on_cycle(result)
+
+                    runtime.capture_account()
+                    if report.cycles % self.reconcile_every == 0:
+                        report.reconciliations.append(runtime.reconcile(context="periodic"))
                 except KeyboardInterrupt:
                     report.stopped_reason = "interrupted"
                     self._stop = True
                     break
+                except Exception as exc:  # noqa: BLE001 - the loop must not die silently
+                    error = f"{type(exc).__name__}: {exc}"
+                    report.errors.append(error)
+                    log.error("cycle failed", extra={"context": {"error": error[:300]}})
+                    if recorder is not None:
+                        recorder.record_api_error(error)
+
+                consecutive_errors = 0 if error is None else consecutive_errors + 1
+                if consecutive_errors >= self._max_errors:
+                    runtime.set_state(
+                        SystemState.HALTED,
+                        f"{consecutive_errors} consecutive cycle errors; last: {error}",
+                    )
+                    report.stopped_reason = "halted after repeated errors"
+                    self._notify(f"CRYPTOBOT halted after {consecutive_errors} cycle errors")
+                    break
+
+                report.cycles += 1
+                if recorder is not None:
+                    recorder.checkpoint(cycles=report.cycles)
+                if iterations is not None and report.cycles >= iterations:
+                    continue
+                if self.interval_seconds > 0 and not self._stop:
+                    try:
+                        self._sleep(self.interval_seconds)
+                    except KeyboardInterrupt:
+                        report.stopped_reason = "interrupted"
+                        self._stop = True
+                        break
+        finally:
+            if recorder is not None:
+                recorder.close(report.stopped_reason or "loop ended")
 
         if not report.stopped_reason:
             report.stopped_reason = self._stop_reason or "completed"

@@ -65,7 +65,15 @@ class AllocationLedger:
     # -- construction -------------------------------------------------------
 
     def rebuild(self) -> AllocationState:
-        """Recompute all state from persisted events and reservations."""
+        """Recompute all state from persisted events and reservations.
+
+        A reservation larger than the whole ceiling is refused: :meth:`reserve`
+        cannot produce one, so its presence means the journal was edited or
+        restored from a backup that never described this account, and starting
+        on top of it would invent a state that never existed. Committed capital
+        above the ceiling is treated differently - see :meth:`_assert_invariant`
+        - because it is a fact about money already spent rather than a claim.
+        """
         committed = Decimal("0")
         realized = Decimal("0")
         for event in self._journal.ledger_events():
@@ -83,7 +91,7 @@ class AllocationLedger:
         self._realized = realized
         self._reserved = self._journal.reservations()
         state = self.state()
-        if not state.invariant_holds:
+        if state.reserved > state.ceiling + AllocationState.EPSILON:
             raise ReconciliationError(
                 f"allocation ledger invariant violated after rebuild: "
                 f"committed={state.committed} reserved={state.reserved} ceiling={state.ceiling}"
@@ -122,7 +130,15 @@ class AllocationLedger:
     # -- mutations ----------------------------------------------------------
 
     def reserve(self, ref: str, amount: Decimal, note: str | None = None) -> Decimal:
-        """Earmark capital for a pending buy order. Idempotent per ``ref``."""
+        """Earmark capital for a pending buy order. Idempotent per ``ref``.
+
+        The capacity check is repeated inside the write lock. ``available()``
+        above reflects only this process's view; a second process, or one that
+        restarted with orphaned rows, may hold reservations this instance has
+        not seen, and those claims are just as real. ``BEGIN IMMEDIATE``
+        serialises the two writers, so the second one refuses instead of both
+        quietly oversubscribing the ceiling.
+        """
         value = to_decimal(amount, "reserve amount")
         if value <= 0:
             raise ContractError("reservation amount must be positive")
@@ -138,12 +154,27 @@ class AllocationLedger:
                 f"cannot reserve {value}: only {available} of the {self._ceiling} "
                 f"allocation is available"
             )
-        projected = self._committed + sum(self._reserved.values(), Decimal("0")) + value
         with self._journal.transaction():
+            persisted = self._journal.reservations()
+            if ref in persisted:
+                if persisted[ref] == value:
+                    self._reserved = dict(persisted)
+                    return value
+                raise DuplicateOrderError(
+                    f"reservation {ref} already exists with {persisted[ref]}, not {value}"
+                )
+            already = sum(persisted.values(), Decimal("0"))
+            projected = self._committed + already + value
+            if projected > self._ceiling + AllocationState.EPSILON:
+                raise RiskRejected(
+                    f"cannot reserve {value}: {already} is already reserved in the "
+                    f"journal against a {self._ceiling} ceiling"
+                )
             self._journal.set_reservation(ref, value)
             self._journal.append_ledger_event(
                 RESERVE, value, ref=ref, note=note, allocated_after=projected
             )
+        self._reserved = dict(persisted)
         self._reserved[ref] = value
         self._assert_invariant()
         return value
@@ -253,6 +284,25 @@ class AllocationLedger:
         self._assert_invariant()
         return realized
 
+    def expense_fee(self, amount: Decimal, *, ref: str, note: str) -> Decimal:
+        """Book a fee discovered after the fact.
+
+        Used when the broker posts the actual charge for a trade whose fee was an
+        estimate. A positive ``amount`` is money spent, so it reduces realised P&L.
+        It never touches ``committed``: the fee was never capital deployed.
+        """
+        value = to_decimal(amount, "fee")
+        if value == 0:
+            return Decimal("0")
+        projected = self._committed + sum(self._reserved.values(), Decimal("0"))
+        with self._journal.transaction():
+            self._journal.append_ledger_event(
+                REALIZE, -value, ref=ref, note=note, allocated_after=projected
+            )
+        self._realized -= value
+        self._assert_invariant()
+        return value
+
     def adjust(self, amount: Decimal, *, ref: str, note: str) -> None:
         """Operator correction. Requires an explicit reason."""
         if not note:
@@ -272,11 +322,30 @@ class AllocationLedger:
     # -- invariants ---------------------------------------------------------
 
     def _assert_invariant(self) -> None:
+        """Refuse an impossible reservation; *record* an over-deployment.
+
+        ``reserved > ceiling`` cannot arise from correct operation, because
+        :meth:`reserve` refuses it inside the write lock. Seeing it means this
+        instance's view has diverged from the journal, and continuing to mutate
+        would be guesswork, so it raises.
+
+        ``committed > ceiling`` is a different kind of event. A fill that costs
+        more than the reservation predicted - a price that gapped up between
+        sizing and execution - has already spent real money. The ledger's job is
+        to record money that was spent, not to reject it. Raising here would
+        leave the fill row written, the order record stale, and the ledger
+        permanently unable to book the sell that unwinds the position, because
+        every later mutation would raise on the same condition. The breach is
+        recorded and the system halted instead: see
+        :meth:`cryptobot.execution.service.OrderService._flag_over_deployment`,
+        and the ``allocation_invariant`` check that preflight and acceptance run
+        over ``state().invariant_holds``.
+        """
         state = self.state()
-        if not state.invariant_holds:
+        if state.reserved > state.ceiling + AllocationState.EPSILON:
             raise ReconciliationError(
-                "allocation invariant broken: "
-                f"committed={state.committed} + reserved={state.reserved} > ceiling={self._ceiling}"
+                "allocation reservation above the ceiling: "
+                f"reserved={state.reserved} > ceiling={self._ceiling}"
             )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid

@@ -478,3 +478,204 @@ def test_challengers_never_promotes_on_synthetic_data(tmp_path, capsys) -> None:
     assert "no challenger may replace the baseline" in output
     assert "SYNTHETIC" in output
 
+
+# ---------------------------------------------------------------------------
+# leaving a halt
+# ---------------------------------------------------------------------------
+
+
+def _halt(tmp_path, reason: str = "drift") -> None:
+    journal = _journal(tmp_path)
+    try:
+        journal.set_system_state(SystemState.HALTED, reason)
+    finally:
+        journal.close()
+
+
+def _state(tmp_path) -> SystemState:
+    journal = _journal(tmp_path)
+    try:
+        return journal.get_system_state()[0]
+    finally:
+        journal.close()
+
+
+def test_unhalt_requires_a_reason_and_does_nothing_without_one(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+    _halt(tmp_path)
+
+    assert main(["unhalt", "--config", config]) == REFUSED
+    assert "--reason is required" in capsys.readouterr().err
+    assert _state(tmp_path) is SystemState.HALTED
+
+
+def test_unhalt_returns_to_paused_entries_not_active(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+    _halt(tmp_path)
+
+    code = _run(["unhalt", "--reason", "checked reconcile output"], config)
+    output = capsys.readouterr().out
+
+    assert code == OK
+    assert "halted -> pause_entries" in output
+    assert "cryptobot resume" in output
+    assert _state(tmp_path) is SystemState.PAUSE_ENTRIES
+
+
+def test_unhalt_can_enable_entries_when_asked_explicitly(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+    _halt(tmp_path)
+
+    assert _run("unhalt --reason checked --active", config) == OK
+
+    assert _state(tmp_path) is SystemState.ACTIVE
+
+
+def test_unhalt_refuses_while_the_allocation_invariant_is_broken(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+    _halt(tmp_path)
+    journal = _journal(tmp_path)
+    try:
+        journal.set_reservation("rogue", Decimal("150"))
+    finally:
+        journal.close()
+
+    code = _run(["unhalt", "--reason", "checked the ledger"], config)
+    error = capsys.readouterr().err
+
+    assert code == REFUSED
+    assert "refusing to unhalt" in error
+    assert "invariant" in error
+    assert _state(tmp_path) is SystemState.HALTED
+
+
+def test_unhalt_refuses_while_an_order_is_unresolved(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+    _halt(tmp_path)
+    journal = _journal(tmp_path)
+    try:
+        from conftest import make_intent
+
+        intent = make_intent(client_order_id="cb-uncertain", quantity="0.001")
+        journal.record_intent(intent)
+        journal.upsert_order(
+            OrderRecord(
+                client_order_id=intent.client_order_id,
+                symbol=intent.symbol,
+                side=Side.BUY,
+                quantity=intent.quantity,
+                status=OrderStatus.UNCERTAIN,
+                updated_at=journal.now(),
+            )
+        )
+    finally:
+        journal.close()
+
+    code = _run(["unhalt", "--reason", "checked the ledger"], config)
+    error = capsys.readouterr().err
+
+    assert code == REFUSED
+    assert "need broker confirmation" in error
+    assert "cb-uncertain" in error
+    assert _state(tmp_path) is SystemState.HALTED
+
+
+def test_unhalt_on_a_running_system_changes_nothing(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+
+    code = _run("unhalt --reason nothing-to-do", config)
+
+    assert code == OK
+    assert "not halted" in capsys.readouterr().out
+    assert _state(tmp_path) is SystemState.ACTIVE
+
+
+def test_unhalt_is_recorded_for_the_audit_trail(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+    _halt(tmp_path, reason="allocation breach")
+    assert _run(["unhalt", "--reason", "reconciled by hand"], config) == OK
+    capsys.readouterr()
+
+    journal = _journal(tmp_path)
+    try:
+        events = [row["kind"] for row in journal.recent_reconciliations(5)]
+    finally:
+        journal.close()
+
+    assert "operator_state_change" in events
+
+
+def test_resume_cannot_undo_a_halt(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+    _halt(tmp_path, reason="allocation breach")
+
+    code = _run("resume --reason done", config)
+    error = capsys.readouterr().err
+
+    assert code == REFUSED
+    assert "refusing to resume" in error
+    assert "halted" in error
+    assert "cryptobot unhalt" in error
+    assert _state(tmp_path) is SystemState.HALTED, "a refusal changes nothing"
+
+
+def test_resume_cannot_undo_the_kill_switch(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+    assert _run(["kill", "--reason", "flash crash"], config) == OK
+    capsys.readouterr()
+
+    code = _run(["resume", "--reason", "looks calm now"], config)
+
+    assert code == REFUSED
+    assert "killed" in capsys.readouterr().err
+    assert _state(tmp_path) is SystemState.KILLED
+
+
+def test_unhalt_can_release_the_kill_switch(tmp_path, capsys) -> None:
+    config = _config(tmp_path)
+    assert _run(["kill", "--reason", "flash crash"], config) == OK
+    capsys.readouterr()
+
+    code = _run(["unhalt", "--reason", "market reopened"], config)
+    output = capsys.readouterr().out
+
+    assert code == OK
+    assert "killed -> pause_entries" in output
+    assert _state(tmp_path) is SystemState.PAUSE_ENTRIES
+
+
+# ---------------------------------------------------------------------------
+# credential setup
+# ---------------------------------------------------------------------------
+
+
+def test_env_hint_names_the_variables_without_reading_the_values(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    monkeypatch.setenv("ALPACA_API_KEY", "PKNEVERPRINTED")
+    monkeypatch.setenv("ALPACA_API_SECRET_KEY", "SKNEVERPRINTED")
+
+    assert _run("env-hint --shell powershell", _config(tmp_path)) == OK
+    output = capsys.readouterr().out
+
+    assert "ALPACA_API_KEY" in output
+    assert "ALPACA_API_SECRET_KEY" in output
+    assert "$env:ALPACA_API_KEY" in output
+    assert "set" in output
+    assert "PKNEVERPRINTED" not in output
+    assert "SKNEVERPRINTED" not in output
+
+
+def test_env_hint_reports_unset_credentials_and_bash_syntax(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_API_SECRET_KEY", raising=False)
+
+    assert _run("env-hint --shell bash", _config(tmp_path)) == OK
+    output = capsys.readouterr().out
+
+    assert "NOT SET" in output
+    assert "required variable(s) unset" in output
+    assert 'export ALPACA_API_KEY="..."' in output
+

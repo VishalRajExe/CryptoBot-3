@@ -11,18 +11,27 @@ Paper-only by construction, in four independent layers:
    client's base URL when available and raises if it is not a paper host.
 
 Order payload construction (:func:`build_order_payload`) is a pure function and
-is unit-tested; only the ``alpaca-py`` request marshalling is exercised solely
-against the real SDK (marked ``@pytest.mark.broker`` and skipped by default).
+is unit-tested without the SDK. The marshalling below is exercised against the
+real ``alpaca-py`` in ``tests/test_sdk_integration.py``: genuine request models,
+response models and exceptions, with every HTTP call intercepted. That file is
+the second of four verification levels (unit / SDK-mocked / authenticated paper /
+soak); the last two have **not** been performed against a real account in this
+environment.
 
 Crypto specifics encoded here, all verified in docs/API_CAPABILITIES.md:
-``qty`` is sent as a decimal string, ``time_in_force`` is ``gtc`` or ``ioc``
-(never ``day``), and ``client_order_id`` is always deterministic.
+``qty`` is built as a decimal string (which the SDK then types as a number),
+``time_in_force`` is ``gtc`` or ``ioc`` (never ``day``), and ``client_order_id``
+is always deterministic.
 """
 
 from __future__ import annotations
 
+import json
 import os
-from datetime import datetime, timezone
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Sequence
 
@@ -43,6 +52,7 @@ from cryptobot.core.errors import (
     PaperOnlyViolation,
 )
 from cryptobot.execution.base import BrokerAccount, BrokerOrder, BrokerPosition
+from cryptobot.execution.fees import FEE_ACTIVITY_TYPES, FeeActivity, parse_fee_activities
 
 UTC = timezone.utc
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
@@ -59,8 +69,38 @@ def _utcnow() -> datetime:
 
 
 def _value(raw: Any) -> Any:
-    """Unwrap enum-like attributes without importing alpaca types."""
+    """Unwrap an enum-like attribute to the broker's own text.
+
+    Used for anything that may end up in a comparison or a log, so a status or
+    endpoint compares as ``partially_filled`` rather than as ``Member.X`` and never
+    depends on whether a particular enum happens to subclass ``str``.
+    """
     return getattr(raw, "value", raw)
+
+
+def _readable_url(client: Any) -> str | None:
+    """The endpoint a client is actually pointed at, whatever form it stores.
+
+    Returns ``None`` when nothing can be read; callers decide whether that is
+    fatal. Enum members, plain strings and ``url_override`` are all covered.
+    """
+    for attribute in ("_base_url", "base_url", "url_override"):
+        try:
+            candidate = _value(getattr(client, attribute, None))
+        except Exception:  # noqa: BLE001 - a property may raise; absence is not evidence
+            continue
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return None
+
+
+def _is_alpaca_trading_client(client: Any) -> bool:
+    """True when this really is an alpaca-py trading client (SDK permitting)."""
+    try:
+        from alpaca.trading.client import TradingClient
+    except Exception:  # noqa: BLE001 - SDK absent means it cannot be one
+        return False
+    return isinstance(client, TradingClient)
 
 
 def assert_paper_base_url(url: str | None) -> str:
@@ -184,11 +224,25 @@ class AlpacaPaperBroker:
 
     @staticmethod
     def assert_paper_only_client(client: Any) -> None:
-        for attribute in ("_base_url", "base_url"):
-            url = getattr(client, attribute, None)
-            if isinstance(url, str) and url.strip():
-                assert_paper_base_url(url)
-                return
+        """Refuse a client that is not pointed at the paper host.
+
+        ``alpaca-py`` stores the endpoint in ``_base_url`` as a ``BaseURL`` member,
+        which subclasses ``str``, so a stock client is caught by the loop below.
+        The parts worth having are the ones a bare ``_base_url`` check misses:
+        ``url_override`` redirects a paper client to another host without touching
+        ``_base_url``, and a genuine ``TradingClient`` whose endpoint cannot be read
+        at all is refused rather than waved through, because paper-only cannot be
+        proven for it.
+        """
+        url = _readable_url(client)
+        if url is not None:
+            assert_paper_base_url(url)
+            return
+        if _is_alpaca_trading_client(client):
+            raise PaperOnlyViolation(
+                "refusing an alpaca trading client whose endpoint cannot be read; "
+                "paper-only cannot be proven, so it is not assumed"
+            )
 
     def _require_client(self) -> Any:
         if self._client is None:
@@ -255,6 +309,8 @@ class AlpacaPaperBroker:
                     market_value=getattr(raw, "market_value", "0"),
                     unrealized_pl=getattr(raw, "unrealized_pl", "0") or "0",
                     current_price=getattr(raw, "current_price", None),
+                    cost_basis=getattr(raw, "cost_basis", None),
+                    qty_available=getattr(raw, "qty_available", None),
                 )
             )
         return out
@@ -270,6 +326,7 @@ class AlpacaPaperBroker:
             status=str(_value(getattr(raw, "status", "ACTIVE"))),
             trading_blocked=bool(getattr(raw, "trading_blocked", False)),
             account_blocked=bool(getattr(raw, "account_blocked", False)),
+            accrued_fees=getattr(raw, "accrued_fees", None),
         )
 
     # -- normalisation ------------------------------------------------------
@@ -304,10 +361,32 @@ class AlpacaPaperBroker:
 
     @staticmethod
     def _is_not_found(exc: Exception) -> bool:
-        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-        if status == 404:
+        """True when the broker has no such order.
+
+        Deliberately does not touch ``exc.code``: that property parses the error
+        body and raises for any payload without a ``code`` key, which would turn
+        "no such order" into a crash inside the handler that exists to absorb it.
+        """
+        if AlpacaPaperBroker._status_of(exc) == 404:
             return True
         return "not found" in str(exc).lower()
+
+    @staticmethod
+    def _status_of(exc: Exception) -> int | None:
+        """HTTP status of an SDK exception, read without trusting the object.
+
+        ``APIError.status_code`` is a property that dereferences a wrapped
+        ``requests`` response, and ``APIError.code`` does
+        ``json.loads(self._error)["code"]`` - which raises ``KeyError`` or
+        ``JSONDecodeError`` for any payload that is not shaped as expected. A
+        classifier that raises inside an ``except`` block converts a definite
+        rejection into an unclassified crash, so every read is defensive here.
+        """
+        try:
+            status = getattr(exc, "status_code", None)
+        except Exception:  # noqa: BLE001
+            return None
+        return status if isinstance(status, int) else None
 
     @staticmethod
     def _classify(exc: Exception) -> ExecutionError:
@@ -317,8 +396,8 @@ class AlpacaPaperBroker:
         rejection is precisely how bots submit duplicate orders.
         """
         text = str(exc)
-        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-        if isinstance(status, int):
+        status = AlpacaPaperBroker._status_of(exc)
+        if status is not None:
             if status == 429 or status >= 500:
                 return AmbiguousSubmission(f"transient broker error {status}: {text}")
             if 400 <= status < 500:
@@ -326,6 +405,87 @@ class AlpacaPaperBroker:
         if isinstance(exc, (TimeoutError, ConnectionError)):
             return AmbiguousSubmission(f"network failure during submit: {text}")
         return AmbiguousSubmission(f"unclassified submission failure: {text}")
+
+    # -- fees ---------------------------------------------------------------
+
+    def list_fee_activities(self, *, after: date | None = None) -> list[FeeActivity]:
+        """Posted crypto fees. Read-only: this never places or changes an order.
+
+        ``alpaca-py`` exposes no activities API, so this calls the documented
+        endpoint directly with the same credentials. One activity type per request
+        avoids relying on how a repeated query parameter is encoded.
+        """
+        key, secret = self._config.credentials(self._env)
+        out: list[FeeActivity] = []
+        for activity_type in FEE_ACTIVITY_TYPES:
+            out.extend(
+                parse_fee_activities(self._fetch_activities(activity_type, after=after, key=key, secret=secret))
+            )
+        return sorted(out, key=lambda item: item.ts)
+
+    def _fetch_activities(
+        self,
+        activity_type: str,
+        *,
+        after: date | None,
+        key: str,
+        secret: str,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        base = self.base_url
+        rows: list[dict[str, Any]] = []
+        page_token: str | None = None
+        for _ in range(50):  # bounded: 50 pages is far more than a day produces
+            query: dict[str, str] = {
+                "activity_types": activity_type,
+                "direction": "asc",
+                "page_size": str(page_size),
+            }
+            if after is not None:
+                query["after"] = after.isoformat()
+            if page_token:
+                query["page_token"] = page_token
+            url = f"{base}/v2/account/activities?{urllib.parse.urlencode(query)}"
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "APCA-API-KEY-ID": key,
+                    "APCA-API-SECRET-KEY": secret,
+                    "accept": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    body = response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                # The message must not echo headers, which carry the secret.
+                raise ExecutionError(
+                    f"activity request failed for {activity_type}: HTTP {exc.code}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise ExecutionError(
+                    f"activity request failed for {activity_type}: {exc.reason}"
+                ) from exc
+
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise ExecutionError("activity response was not JSON") from exc
+            if isinstance(payload, dict):
+                raise ExecutionError(
+                    f"activity request for {activity_type} returned an error object: "
+                    f"{str(payload.get('message', payload))[:200]}"
+                )
+            if not isinstance(payload, list) or not payload:
+                break
+            rows.extend(item for item in payload if isinstance(item, dict))
+            if len(payload) < page_size:
+                break
+            # Documented pagination: the token is the id of the last row returned.
+            page_token = str(payload[-1].get("id") or "")
+            if not page_token:
+                break
+        return rows
 
     # -- preflight ----------------------------------------------------------
 

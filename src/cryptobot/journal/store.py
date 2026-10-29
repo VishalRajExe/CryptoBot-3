@@ -28,6 +28,7 @@ from cryptobot.core.contracts import (
     RiskVerdict,
     Side,
     StrategySignal,
+    quote_currency,
     to_decimal,
 )
 from cryptobot.core.errors import ContractError, DuplicateOrderError, ExecutionError
@@ -71,8 +72,13 @@ class Journal:
         self._conn = conn
         for statement in schema.DDL:
             conn.execute(statement)
+        # Every migration so far is additive DDL guarded by IF NOT EXISTS, so
+        # re-stamping the version is the whole migration. It is an upsert rather
+        # than INSERT OR IGNORE so an existing journal reports the schema it now
+        # actually has instead of the one it was created with.
         conn.execute(
-            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+            "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(schema.SCHEMA_VERSION),),
         )
         conn.execute(
@@ -468,32 +474,116 @@ class Journal:
         rows = self.conn.execute(query, tuple(params)).fetchall()
         return [FillRecord.from_row(r) for r in rows]
 
+    def correct_fill_fee(self, fill_id: str, fee: Decimal) -> Decimal | None:
+        """Replace an estimated fee with the broker's actual figure.
+
+        Returns the previous fee, or ``None`` when the fill is unknown. The fee on
+        a fill is an estimate until the broker posts the activity, so this is a
+        correction rather than a rewrite: quantity, price and timestamps are not
+        touched, and the ledger receives a matching adjustment event.
+        """
+        row = self.conn.execute(
+            "SELECT fee FROM fills WHERE fill_id=?", (fill_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        previous = to_decimal(row["fee"], "fee")
+        self.conn.execute(
+            "UPDATE fills SET fee=? WHERE fill_id=?", (format(fee, "f"), fill_id)
+        )
+        self.conn.commit()
+        return previous
+
+    def fee_activity_ids(self) -> set[str]:
+        rows = self.conn.execute("SELECT activity_id FROM fee_activities").fetchall()
+        return {row["activity_id"] for row in rows}
+
+    def matched_fee_fill_ids(self) -> set[str]:
+        """Fills that already have an actual fee attributed to them."""
+        rows = self.conn.execute(
+            "SELECT matched_fill_id FROM fee_activities WHERE matched_fill_id IS NOT NULL"
+        ).fetchall()
+        return {row["matched_fill_id"] for row in rows}
+
+    def record_fee_activity(self, row: Mapping[str, Any]) -> bool:
+        """Store one attributed fee. Returns False when it was already recorded."""
+        cursor = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO fee_activities (
+                activity_id, ts, kind, symbol, qty, price, currency, quote_value,
+                matched_client_order_id, matched_fill_id, delta_quote, description, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["activity_id"],
+                row["ts"],
+                row["kind"],
+                row["symbol"],
+                row["qty"],
+                row["price"],
+                row["currency"],
+                row["quote_value"],
+                row.get("matched_client_order_id"),
+                row.get("matched_fill_id"),
+                row["delta_quote"],
+                row.get("description"),
+                row["recorded_at"],
+            ),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def fee_activities(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM fee_activities ORDER BY ts DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def sum_fees(self, since: datetime | None = None) -> Decimal:
-        query = "SELECT fee FROM fills"
+        """Total fees in quote currency.
+
+        Fees are charged in the asset a trade credits, so a buy reports its fee in
+        the base asset. Summing the raw column would add BTC to USD; every fee is
+        valued at its fill price first.
+        """
+        query = "SELECT symbol, fee, fee_currency, price FROM fills"
         params: tuple[Any, ...] = ()
         if since is not None:
             query += " WHERE ts >= ?"
             params = (since.isoformat(),)
         total = Decimal("0")
         for row in self.conn.execute(query, params).fetchall():
-            total += to_decimal(row["fee"], "fee")
+            fee = to_decimal(row["fee"], "fee")
+            if row["fee_currency"] != quote_currency(row["symbol"]):
+                fee *= to_decimal(row["price"], "price")
+            total += fee
         return total
 
     def realized_position(self, symbol: str) -> tuple[Decimal, Decimal]:
         """(quantity, average cost) implied by fills alone.
 
         Used as an independent cross-check of the allocation ledger against the
-        broker's position.
+        broker's position. A crypto buy pays its fee out of the base asset it is
+        credited with, so the holding is the net quantity even though the fill
+        itself records what the broker executed.
         """
         rows = self.conn.execute(
-            "SELECT qty, price, side FROM fills WHERE symbol=? ORDER BY ts ASC", (symbol,)
+            "SELECT qty, price, side, fee, fee_currency FROM fills WHERE symbol=? ORDER BY ts ASC",
+            (symbol,),
         ).fetchall()
+        quote = quote_currency(symbol)
         qty = Decimal("0")
         cost = Decimal("0")
         for row in rows:
             fill_qty = to_decimal(row["qty"], "qty")
             price = to_decimal(row["price"], "price")
             if row["side"] == Side.BUY.value:
+                held = fill_qty
+                if row["fee_currency"] != quote:
+                    held -= to_decimal(row["fee"], "fee")
+                if held <= 0:
+                    continue
+                fill_qty = held
                 qty += fill_qty
                 cost += fill_qty * price
             else:
@@ -583,6 +673,75 @@ class Journal:
             """,
             (SystemState(state).value, reason, self.now().isoformat()),
         )
+
+    # -- promotions ---------------------------------------------------------
+
+    def record_promotion(
+        self,
+        *,
+        strategy: str,
+        params: Mapping[str, Any],
+        evidence_digest: str,
+        approved_by: str,
+        approved_at: datetime,
+        reason: str,
+        out_of_sample_return_pct: Decimal,
+        out_of_sample_drawdown_pct: Decimal,
+        out_of_sample_trades: int,
+        baseline_return_pct: Decimal,
+    ) -> int:
+        """Append a human approval of one strategy configuration.
+
+        This is an audit row, not a switch: nothing loads a promotion to decide
+        how to trade. The parameters are replayed by whoever edits the
+        configuration, and this row is what they can point at afterwards.
+        """
+        for name, value in (
+            ("strategy", strategy),
+            ("approved_by", approved_by),
+            ("reason", reason),
+            ("evidence_digest", evidence_digest),
+        ):
+            if not str(value).strip():
+                raise ContractError(f"a promotion requires {name}")
+        cursor = self.conn.execute(
+            """
+            INSERT INTO strategy_promotions (
+                ts, strategy, params_json, evidence_digest, approved_by, approved_at,
+                reason, out_of_sample_return_pct, out_of_sample_drawdown_pct,
+                out_of_sample_trades, baseline_return_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.now().isoformat(),
+                strategy,
+                jsonutil.dumps(dict(params)),
+                evidence_digest,
+                approved_by,
+                approved_at.isoformat(),
+                reason,
+                _f(to_decimal(out_of_sample_return_pct, "out_of_sample_return_pct")),
+                _f(to_decimal(out_of_sample_drawdown_pct, "out_of_sample_drawdown_pct")),
+                int(out_of_sample_trades),
+                _f(to_decimal(baseline_return_pct, "baseline_return_pct")),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def promotions(self, limit: int = 20) -> list[Mapping[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM strategy_promotions ORDER BY promotion_id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_promotion(self, evidence_digest: str) -> Mapping[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_promotions WHERE evidence_digest=? "
+            "ORDER BY promotion_id DESC LIMIT 1",
+            (evidence_digest,),
+        ).fetchone()
+        return dict(row) if row else None
 
     # -- reconciliation and snapshots ---------------------------------------
 
@@ -804,6 +963,188 @@ class Journal:
             "INSERT INTO notifications (ts, channel, status, detail) VALUES (?, ?, ?, ?)",
             (self.now().isoformat(), channel, status, detail),
         )
+
+    # -- soak instrumentation ------------------------------------------------
+
+    def open_soak_window(self, note: str = "", interval_seconds: Decimal | float = 60.0) -> Mapping[str, Any]:
+        """Return the open soak window, opening one only when there is none.
+
+        Reusing the existing window is the point rather than an optimisation: a
+        restarted process resumes the same interval of evidence instead of
+        quietly starting a fresh clock that would look like uninterrupted
+        operation. Closing a soak is a deliberate operator action.
+
+        The heartbeat interval is recorded with the window because coverage is
+        judged against the cadence the operator declared, not against a default
+        that would mislabel a slow loop as a gap.
+        """
+        interval = to_decimal(interval_seconds, "interval_seconds")
+        row = self.conn.execute(
+            "SELECT * FROM soak_windows WHERE ended_at IS NULL "
+            "ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            existing = to_decimal(row["interval_seconds"], "interval_seconds")
+            if interval > existing:
+                self.conn.execute(
+                    "UPDATE soak_windows SET interval_seconds=? WHERE window_id=?",
+                    (_f(interval), row["window_id"]),
+                )
+                self.record_soak_event(
+                    row["window_id"],
+                    "interval_changed",
+                    f"heartbeat interval {existing} -> {interval} seconds",
+                )
+                return dict(self.soak_window() or row)
+            return dict(row)
+        window_id = f"soak-{uuid.uuid4().hex[:12]}"
+        timestamp = self.now().isoformat()
+        self.conn.execute(
+            "INSERT INTO soak_windows "
+            "(window_id, started_at, ended_at, interval_seconds, note, created_at) "
+            "VALUES (?, ?, NULL, ?, ?, ?)",
+            (window_id, timestamp, _f(interval), note, timestamp),
+        )
+        self.conn.commit()
+        return self.soak_window() or {}
+
+    def soak_window(self) -> Mapping[str, Any] | None:
+        """The most recent soak window, open or closed."""
+        row = self.conn.execute(
+            "SELECT * FROM soak_windows ORDER BY started_at DESC, created_at DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def close_soak_window(self, reason: str = "") -> int:
+        """End every open window. Returns how many were closed."""
+        ended = self.now().isoformat()
+        note_suffix = f" (closed: {reason})" if reason else " (closed)"
+        rows = self.conn.execute(
+            "SELECT window_id, note FROM soak_windows WHERE ended_at IS NULL"
+        ).fetchall()
+        for row in rows:
+            self.conn.execute(
+                "UPDATE soak_windows SET ended_at=?, note=? WHERE window_id=?",
+                (ended, f"{row['note'] or ''}{note_suffix}", row["window_id"]),
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def start_soak_process(self, window_id: str, note: str = "") -> str:
+        process_id = f"run-{uuid.uuid4().hex[:12]}"
+        self.conn.execute(
+            "INSERT INTO soak_processes "
+            "(process_id, window_id, started_at, ended_at, exit_reason, note) "
+            "VALUES (?, ?, ?, NULL, NULL, ?)",
+            (process_id, window_id, self.now().isoformat(), note),
+        )
+        self.conn.commit()
+        return process_id
+
+    def end_soak_process(self, process_id: str, reason: str = "") -> None:
+        self.conn.execute(
+            "UPDATE soak_processes SET ended_at=?, exit_reason=? "
+            "WHERE process_id=? AND ended_at IS NULL",
+            (self.now().isoformat(), reason, process_id),
+        )
+        self.conn.commit()
+
+    def soak_processes(self, window_id: str | None = None) -> list[Mapping[str, Any]]:
+        query = "SELECT * FROM soak_processes"
+        params: tuple[Any, ...] = ()
+        if window_id is not None:
+            query += " WHERE window_id=?"
+            params = (window_id,)
+        rows = self.conn.execute(query + " ORDER BY started_at ASC", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_soak_checkpoint(
+        self,
+        window_id: str,
+        process_id: str,
+        *,
+        uptime_seconds: Decimal,
+        cycles: int,
+        decisions: int,
+        orders: int,
+        fills: int,
+        api_errors: int,
+        note: str = "",
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO soak_checkpoints (
+                window_id, process_id, ts, uptime_seconds, cycles, decisions,
+                orders, fills, api_errors, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                window_id,
+                process_id,
+                self.now().isoformat(),
+                _f(uptime_seconds),
+                int(cycles),
+                int(decisions),
+                int(orders),
+                int(fills),
+                int(api_errors),
+                note,
+            ),
+        )
+        self.conn.commit()
+
+    def soak_checkpoints(self, window_id: str | None = None) -> list[Mapping[str, Any]]:
+        query = "SELECT * FROM soak_checkpoints"
+        params: tuple[Any, ...] = ()
+        if window_id is not None:
+            query += " WHERE window_id=?"
+            params = (window_id,)
+        rows = self.conn.execute(
+            query + " ORDER BY ts ASC, checkpoint_id ASC", params
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_soak_event(self, window_id: str, kind: str, detail: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO soak_events (window_id, ts, kind, detail) VALUES (?, ?, ?, ?)",
+            (window_id, self.now().isoformat(), kind, detail),
+        )
+        self.conn.commit()
+
+    def soak_events(
+        self, window_id: str | None = None, limit: int = 200
+    ) -> list[Mapping[str, Any]]:
+        query = "SELECT * FROM soak_events"
+        params: tuple[Any, ...] = ()
+        if window_id is not None:
+            query += " WHERE window_id=?"
+            params = (window_id,)
+        rows = self.conn.execute(
+            query + " ORDER BY ts ASC, event_id ASC LIMIT ?", (*params, int(limit))
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def counts_between(
+        self, start: datetime, end: datetime
+    ) -> dict[str, dict[str, int]]:
+        """Per-UTC-day decision, order and fill counts for ``[start, end)``.
+
+        Grouped in SQL so a daily summary is one query per table instead of
+        loading every row into Python.
+        """
+        bounds = (start.isoformat(), end.isoformat())
+        summary: dict[str, dict[str, int]] = {}
+        for table, key in (("decisions", "decisions"), ("order_intents", "orders"), ("fills", "fills")):
+            rows = self.conn.execute(
+                f"SELECT substr(ts, 1, 10) AS day, COUNT(*) AS n FROM {table} "
+                "WHERE ts >= ? AND ts < ? GROUP BY day",
+                bounds,
+            ).fetchall()
+            for row in rows:
+                summary.setdefault(row["day"], {"decisions": 0, "orders": 0, "fills": 0})[
+                    key
+                ] = int(row["n"])
+        return summary
 
     # -- diagnostics --------------------------------------------------------
 

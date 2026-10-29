@@ -103,6 +103,16 @@ def quote_currency(symbol: str) -> str:
     return normalize_symbol(symbol).split("/")[1]
 
 
+def credited_currency(symbol: str, side: "Side") -> str:
+    """The asset a trade delivers, which is what Alpaca charges crypto fees in.
+
+    Verified 2026-10-29 against https://docs.alpaca.markets/docs/crypto-fees :
+    "the crypto fee will be charged on the credited crypto asset/fiat (what you
+    receive)". A buy credits the base asset, a sell credits the quote asset.
+    """
+    return base_currency(symbol) if Side(side) is Side.BUY else quote_currency(symbol)
+
+
 # ---------------------------------------------------------------------------
 # enums
 # ---------------------------------------------------------------------------
@@ -671,9 +681,36 @@ class FillRecord:
     def gross_notional(self) -> Decimal:
         return self.quantity * self.price
 
+    @property
+    def fee_is_in_base(self) -> bool:
+        return self.fee_currency == base_currency(self.symbol)
+
+    @property
+    def fee_is_in_quote(self) -> bool:
+        return self.fee_currency == quote_currency(self.symbol)
+
     def fee_in_quote(self) -> Decimal:
         """Fees are charged in the received asset; convert to quote for accounting."""
         return self.fee if self.fee_currency == quote_currency(self.symbol) else self.fee * self.price
+
+    @property
+    def net_quantity(self) -> Decimal:
+        """Quantity the account is actually credited with.
+
+        A buy settles by crediting the base asset and then charging the fee in
+        that same asset, so the balance grows by ``quantity - fee``. Booking the
+        gross quantity would overstate the position by the fee and make the next
+        reconciliation report a drift that is not real.
+        """
+        if self.side is Side.BUY and self.fee_is_in_base:
+            netted = self.quantity - self.fee
+            if netted <= 0:
+                raise ContractError(
+                    f"{self.symbol}: fee {self.fee} consumes the whole fill quantity "
+                    f"{self.quantity}; refusing to record a non-positive position"
+                )
+            return netted
+        return self.quantity
 
     @property
     def natural_key(self) -> str:

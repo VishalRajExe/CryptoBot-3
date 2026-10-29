@@ -14,7 +14,7 @@ Design notes that matter for correctness:
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 
 DDL: tuple[str, ...] = (
     """
@@ -240,4 +240,103 @@ DDL: tuple[str, ...] = (
         detail  TEXT
     )
     """,
+    # Schema 2. Crypto fees are posted by the broker after the trading day, so the
+    # ledger starts with an estimate and is corrected once per activity. Keying on
+    # the activity id is what makes re-running the sync idempotent.
+    """
+    CREATE TABLE IF NOT EXISTS fee_activities (
+        activity_id             TEXT PRIMARY KEY,
+        ts                      TEXT NOT NULL,
+        kind                    TEXT NOT NULL,
+        symbol                  TEXT NOT NULL,
+        qty                     TEXT NOT NULL,
+        price                   TEXT,
+        currency                TEXT NOT NULL,
+        quote_value             TEXT NOT NULL,
+        matched_client_order_id TEXT,
+        matched_fill_id         TEXT,
+        delta_quote             TEXT NOT NULL,
+        description             TEXT,
+        recorded_at             TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_fee_activities_ts ON fee_activities(ts DESC)",
+    # Schema 3. Soak evidence. Duration is measured from these rows rather than
+    # from the elapsed wall clock, so time during which the process was not
+    # running cannot be mistaken for continuous operation. A window is the
+    # interval under test and survives restarts; a process is one run of the bot
+    # inside that window; a checkpoint is a heartbeat proving the loop was alive.
+    """
+    CREATE TABLE IF NOT EXISTS soak_windows (
+        window_id        TEXT PRIMARY KEY,
+        started_at       TEXT NOT NULL,
+        ended_at         TEXT,
+        interval_seconds TEXT NOT NULL DEFAULT '60',
+        note             TEXT NOT NULL DEFAULT '',
+        created_at       TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_soak_windows_start ON soak_windows(started_at DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS soak_processes (
+        process_id  TEXT PRIMARY KEY,
+        window_id   TEXT NOT NULL REFERENCES soak_windows(window_id),
+        started_at  TEXT NOT NULL,
+        ended_at    TEXT,
+        exit_reason TEXT,
+        note        TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_soak_processes_window "
+    "ON soak_processes(window_id, started_at)",
+    """
+    CREATE TABLE IF NOT EXISTS soak_checkpoints (
+        checkpoint_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+        window_id      TEXT NOT NULL REFERENCES soak_windows(window_id),
+        process_id     TEXT NOT NULL REFERENCES soak_processes(process_id),
+        ts             TEXT NOT NULL,
+        uptime_seconds TEXT NOT NULL,
+        cycles         INTEGER NOT NULL,
+        decisions      INTEGER NOT NULL,
+        orders         INTEGER NOT NULL,
+        fills          INTEGER NOT NULL,
+        api_errors     INTEGER NOT NULL,
+        note           TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_soak_checkpoints_window ON soak_checkpoints(window_id, ts)",
+    """
+    CREATE TABLE IF NOT EXISTS soak_events (
+        event_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+        window_id TEXT NOT NULL REFERENCES soak_windows(window_id),
+        ts        TEXT NOT NULL,
+        kind      TEXT NOT NULL,
+        detail    TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_soak_events_window ON soak_events(window_id, ts)",
+    #
+    # A strategy promotion is a human decision, so it is stored as one: who
+    # approved it, when, why, and the digest of the exact evidence they were
+    # shown. Nothing reads this table to change behaviour - the operator edits
+    # their configuration - but the audit trail cannot be reconstructed later
+    # without it.
+    """
+    CREATE TABLE IF NOT EXISTS strategy_promotions (
+        promotion_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts                        TEXT NOT NULL,
+        strategy                  TEXT NOT NULL,
+        params_json               TEXT NOT NULL,
+        evidence_digest           TEXT NOT NULL,
+        approved_by               TEXT NOT NULL,
+        approved_at               TEXT NOT NULL,
+        reason                    TEXT NOT NULL,
+        out_of_sample_return_pct  TEXT NOT NULL,
+        out_of_sample_drawdown_pct TEXT NOT NULL,
+        out_of_sample_trades      INTEGER NOT NULL,
+        baseline_return_pct       TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_promotions_strategy "
+    "ON strategy_promotions(strategy, approved_at)",
 )

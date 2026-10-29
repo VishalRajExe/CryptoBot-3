@@ -33,10 +33,14 @@ class BrokerAccount:
     status: str = "ACTIVE"
     trading_blocked: bool = False
     account_blocked: bool = False
+    #: Fees the broker has accrued but not yet posted as activities.
+    accrued_fees: Decimal | None = None
 
     def __post_init__(self) -> None:
         for name in ("cash", "equity", "buying_power", "non_marginable_buying_power"):
             object.__setattr__(self, name, to_decimal(getattr(self, name), name))
+        if self.accrued_fees is not None:
+            object.__setattr__(self, "accrued_fees", to_decimal(self.accrued_fees, "accrued_fees"))
 
     @property
     def usable(self) -> bool:
@@ -51,13 +55,25 @@ class BrokerPosition:
     market_value: Decimal
     unrealized_pl: Decimal = Decimal("0")
     current_price: Decimal | None = None
+    #: What the broker says the position cost. Preferred over
+    #: ``quantity * avg_entry_price`` when reconciling, because it is the broker's
+    #: own figure rather than one re-derived from two rounded fields.
+    cost_basis: Decimal | None = None
+    #: Quantity the broker will let us sell right now.
+    qty_available: Decimal | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
         for name in ("quantity", "avg_entry_price", "market_value", "unrealized_pl"):
             object.__setattr__(self, name, to_decimal(getattr(self, name), name))
-        if self.current_price is not None:
-            object.__setattr__(self, "current_price", to_decimal(self.current_price, "current_price"))
+        for name in ("current_price", "cost_basis", "qty_available"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, to_decimal(value, name))
+
+    @property
+    def reported_cost_basis(self) -> Decimal:
+        return self.cost_basis if self.cost_basis is not None else self.quantity * self.avg_entry_price
 
     def to_snapshot(self, ts: datetime, source: str = "broker") -> PositionSnapshot:
         last = self.current_price

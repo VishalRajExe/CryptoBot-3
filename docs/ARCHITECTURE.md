@@ -85,27 +85,49 @@ committed capital; `apply_sell` releases it. `rebuild()` replays the journal, so
 the number survives a crash.
 
 `AllocationLedger.__init__` calls `rebuild()` and **raises**
-`ReconciliationError` if `committed + reserved > ceiling`. A ledger that cannot
-explain itself must not be used to trade.
+`ReconciliationError` if `reserved > ceiling`. A reservation above the whole
+ceiling is impossible, because `reserve()` refuses one inside the write lock, so
+seeing it means the journal is internally inconsistent and the ledger must not be
+used to trade.
+
+`committed > ceiling` is treated differently on purpose: it is a *fact* about
+money already spent - a fill that cost more than its reservation, typically after
+a gap. Raising on it would leave the fill row written, the order record stale and
+every later mutation failing, including the sell that unwinds the position. So the
+ledger books it and the order path reacts: a critical `allocation_breach`
+reconciliation, `SystemState.HALTED`, and new entries withdrawn. The invariant is
+still the gate - `invariant_holds` is what preflight, the reconciler and `unhalt`
+all check - but a breach is *recorded and escalated*, never refused into a state
+that cannot be repaired.
 
 Realised P&L is reported, never re-deployed: the ceiling is a constant from
 configuration.
 
 *Tests:* `tests/test_data_risk.py` ledger suite,
-`tests/test_evaluation.py::test_a_reservation_above_the_ceiling_fails_the_invariant`.
+`tests/test_evaluation.py::test_a_reservation_above_the_ceiling_fails_the_invariant`,
+`tests/test_ledger_stress.py` (the ceiling under concurrency, partials, cancels,
+corruption, and a fill above its own reservation).
 
 ### 2.4 Fees are expensed, not capitalised
 
-`committed` is a **fee-free** cost basis (`quantity × price`). Fees are recorded
-as a separate ledger event into `realized_pnl`.
+No fee amount is added to `committed`. Fees are recorded as separate ledger events
+into `realized_pnl`.
 
-Why: the reconciler compares the local basis with the broker's
-`avg_entry_price` basis. If fees were capitalised, every position would show a
-small permanent discrepancy that no amount of correct trading would clear, and a
-closed position would never release the last cent of its reservation.
+Crypto fees are charged on the asset the trade *credits*: a buy in the base asset,
+a sell in the quote asset. So a buy's base-denominated fee is taken out of the
+quantity received, and the cost basis is `net_quantity × price` - the position is
+honestly smaller rather than silently over-valued. A quote-denominated fee on a
+sell is deducted from proceeds. `fill.fee_in_quote()` values either form in the
+quote currency so quantities, costs and fees never mix units.
 
-*Tests:* the ledger and reconciliation suites in `tests/test_data_risk.py` and
-`tests/test_execution.py`.
+Why the basis stays free of the fee *amount*: the reconciler compares the local
+basis with the broker's `avg_entry_price` basis. If fees were capitalised, every
+position would show a small permanent discrepancy that no amount of correct
+trading would clear, and a closed position would never release the last cent of
+its reservation.
+
+*Tests:* `tests/test_fees.py` (22), the ledger and reconciliation suites in
+`tests/test_data_risk.py` and `tests/test_execution.py`.
 
 ### 2.5 Intent before submission
 
@@ -219,18 +241,24 @@ the first one. `entry_gate_reasons` covers the state-dependent gates.
   protocol, not a base class, so a test double does not inherit production
   behaviour.
 - `alpaca_paper.py` — the only SDK-facing module. `build_order_payload` is a
-  pure function and is unit-tested; only request marshalling touches `alpaca-py`,
-  and that is marked `@pytest.mark.broker`.
+  pure function and is unit-tested without the SDK; the request/response
+  marshalling is checked against the real `alpaca-py` in
+  `tests/test_sdk_integration.py` with every HTTP call intercepted, so no test in
+  this suite opens a connection or places an order.
+- `fees.py` — attribution of the fees the broker posts after the fact, since the
+  Orders API reports none (`docs/API_CAPABILITIES.md` §4).
 - `service.py` — the lifecycle: risk verdict → intent → submit → poll →
   reconcile → persist. Enforces "never resubmit an ambiguous order".
 - `simulator.py` — a deterministic adapter for offline runs and tests.
-- `orders.py` — status mapping between broker vocabulary and `OrderStatus`.
+- `orders.py` — deterministic client order ids and intent construction.
 
 ### `reconciliation/`
 
-Compares positions, cash, open orders, and the ledger basis against the broker.
-Emits `Drift` records with a severity. A critical drift records a
-`reconciliation_events` row and, by default, halts entries.
+Compares positions, open orders and the ledger's `committed` against the broker,
+and snapshots cash and equity as evidence. There is no local cash model to compare
+against: the ceiling is a configuration constant, so a large broker balance cannot
+enlarge the risk budget. Emits `Drift` records with a severity; a critical drift
+records a `reconciliation_events` row and, by default, halts entries.
 
 ### `journal/`
 
@@ -257,6 +285,13 @@ have happened", evaluation asks "what did happen".
 - `trades.py` — reconstructs round trips from fills with average-cost
   accounting; measures slippage against the intent's own reference price.
 - `challengers.py` — applies a stated `PromotionRule` to out-of-sample results.
+- `promotion.py` — the human approval gate. `challengers.py` only *recommends*;
+  nothing here can change a configuration. `Evidence.digest` is a SHA-256 over the
+  strategy name, parameters and out-of-sample numbers; `Approval` binds a named
+  person, a reason and a tz-aware timestamp to that digest; `Promotion` refuses a
+  digest mismatch, so no code path can promote before asking. `record(journal)`,
+  the only write this package can make, adds one audit row to
+  `strategy_promotions` (schema v4) and changes no trading state.
 - `acceptance.py` — evaluates the soak criteria. Duration is *pending* while the
   soak runs; anything else that fails is a failure.
 
@@ -276,7 +311,7 @@ not a control surface (`POST` → 501). `notify.py` sends Telegram messages and
 records the outcome; the loop guards the call so a misbehaving notifier cannot
 stop a halt.
 
-### `runtime.py`, `preflight.py`, `engine.py`
+### `runtime.py`, `preflight.py`, `engine.py`, `soak.py`
 
 - `preflight.py` runs ten named checks and returns a `PreflightReport` whose
   failures are blocking and whose warnings are not. It prints *why*, not just
@@ -287,6 +322,11 @@ stop a halt.
 - `engine.py` is one decision cycle: gather bars → strategy → risk → maybe
   execute → journal. It returns a `CycleResult` describing what it decided and
   what it did, which is what the CLI prints and the tests assert on.
+- `soak.py` reads the journal back and answers one question: for exactly which
+  intervals can this journal prove the system was running? It opens and closes a
+  window, records heartbeats and lifecycle events, derives daily summaries, and
+  reports gaps as gaps. It writes only soak rows and never invents history to fill
+  a hole; `evaluation/acceptance.py` consumes its coverage figure.
 
 ---
 

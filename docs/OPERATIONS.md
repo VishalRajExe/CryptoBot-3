@@ -6,11 +6,16 @@ do when something looks wrong, and how to stop it without leaving a mess.
 Read `docs/API_CAPABILITIES.md` §7 before trusting anything a paper run reports
 about fills and slippage.
 
+If this is your first run, work through `docs/PAPER_TRADING_SETUP.md` first: it
+covers credentials, preflight, dry cycles, the soak window and acceptance, in
+order.
+
 ---
 
 ## 1. Before you start anything
 
 ```powershell
+cryptobot env-hint              # variable names + set/NOT SET; never a value
 cryptobot config-check          # effective config, names of missing variables only
 cryptobot preflight --mode paper
 ```
@@ -25,7 +30,7 @@ offline). A run with failures must not be started.
 | `paper_endpoint` | the trading URL is not on the paper allowlist | refuse to run |
 | `database_schema` | the journal cannot be opened or migrated | the journal is the state; no journal, no trading |
 | `allocation_invariant` | `committed + reserved > ceiling` | the ledger cannot explain itself — resolve manually |
-| `system_state` | the kill switch is engaged | `cryptobot resume` after understanding why |
+| `system_state` | the state is `HALTED` or `KILLED` | `cryptobot unhalt` after understanding why |
 | `clock` | the system clock looks wrong | timestamps drive everything; fix the clock first |
 | `unresolved_orders` | an order is `UNCERTAIN`/`ACCEPTED`/`LOST` | resolve with `cryptobot reconcile` before trading again |
 | `credentials` | a named environment variable is absent | a warning offline, a failure for a paper run |
@@ -41,8 +46,9 @@ If a check fails, the command prints the failing check's **detail**, not just
 
 ```powershell
 cryptobot pause --reason "news window"     # stop new entries, keep positions
-cryptobot resume --reason "window closed"  # back to active
+cryptobot resume --reason "window closed"  # back to active (only from PAUSE_ENTRIES)
 cryptobot kill --reason "flash crash"      # kill switch: no entries, no cancels
+cryptobot unhalt --reason "what I checked"  # HALTED/KILLED -> PAUSE_ENTRIES
 ```
 
 | State | New entries | Cancel orders | Keep running | Needs a human |
@@ -64,10 +70,25 @@ Future-you will want to know why past-you did it.
 
 | Trigger | State | Reversible by |
 | --- | --- | --- |
-| critical reconciliation drift | `HALTED` (entries only) | operator, after `reconcile` is clean |
+| critical reconciliation drift | `HALTED` (entries only) | `cryptobot unhalt`, after `reconcile` is clean |
+| a fill that costs more than its reservation | `HALTED` (entries only) | `cryptobot unhalt`, after `cryptobot ledger` explains the over-deployment |
 | `max_consecutive_errors` reached in the loop | loop stops, state is reported | operator |
 | daily loss limit / max drawdown breached (risk check) | entries rejected, state unchanged | next day, or operator |
-| kill switch | `KILLED` | `cryptobot resume`, deliberately |
+| kill switch | `KILLED` | `cryptobot unhalt`, deliberately |
+
+`resume` only works from `PAUSE_ENTRIES`. It refuses to leave `HALTED` or
+`KILLED`, because those two states mean trading should stop and going straight
+back to `ACTIVE` would skip the checks `unhalt` makes. Clearing them is always
+two steps:
+
+```powershell
+cryptobot reconcile                                  # every order resolved
+cryptobot unhalt --reason "checked ledger + orders"  # -> PAUSE_ENTRIES
+cryptobot resume --reason "resuming"                 # -> ACTIVE
+```
+
+`unhalt` refuses a broken allocation invariant and any order that still needs
+broker confirmation, and names what blocked it.
 
 The risk manager rejecting an entry does **not** change the system state. It
 records the verdict and moves on. Confusing "this order was refused" with "the

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -38,7 +39,17 @@ from cryptobot.core.logging import configure_logging, get_logger
 from cryptobot.core.states import SystemState
 from cryptobot.data.alpaca_data import build_data_client
 from cryptobot.evaluation.acceptance import AcceptanceCriteria, run_acceptance
-from cryptobot.evaluation.challengers import PromotionRule, run_challengers
+from cryptobot.evaluation.challengers import (
+    ChallengerReport,
+    PromotionRule,
+    run_challengers,
+)
+from cryptobot.evaluation.promotion import (
+    Evidence,
+    PromotionRefused,
+    approve,
+    evidence_from,
+)
 from cryptobot.evaluation.trades import evaluate_execution, evaluate_trades
 from cryptobot.journal.store import Journal
 from cryptobot.monitoring.dashboard import serve_dashboard
@@ -67,6 +78,7 @@ from cryptobot.research.experiment import (
 from cryptobot.research.vectorbt_support import describe as describe_vectorbt
 from cryptobot.runtime import BrokerMode, Runtime, TradingLoop
 from cryptobot.sizing.ledger import AllocationLedger
+from cryptobot.soak import compute_coverage, daily_report, daily_summaries
 from cryptobot.strategy import available_strategies, strategy_class
 
 log = get_logger(__name__)
@@ -466,14 +478,38 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         return OK if report.ok else FAILED
 
 
-def _set_state(args: argparse.Namespace, state: SystemState, verb: str) -> int:
+def _set_state(
+    args: argparse.Namespace,
+    state: SystemState,
+    verb: str,
+    *,
+    guarded: tuple[SystemState, ...] = (),
+) -> int:
+    """Move to ``state``, refusing when the current state is one of ``guarded``.
+
+    ``guarded`` exists so that a state meaning "a human decided trading stops"
+    cannot be undone by the generic command: leaving it goes through
+    ``cryptobot unhalt``, which checks the ledger and unresolved orders first.
+    """
     settings = _settings(args)
     reason = args.reason
     if not reason:
         print(f"refusing to {verb}: --reason is required", file=sys.stderr)
         return REFUSED
     with _journal(settings) as journal:
-        previous, _, _ = journal.get_system_state()
+        previous, previous_reason, _ = journal.get_system_state()
+        if previous in guarded:
+            print(
+                f"refusing to {verb}: the system is {previous.value}"
+                f" ({previous_reason})",
+                file=sys.stderr,
+            )
+            print(
+                "  investigate first, then run `cryptobot unhalt --reason ...`;"
+                " that checks the allocation invariant and unresolved orders",
+                file=sys.stderr,
+            )
+            return REFUSED
         journal.set_system_state(state, reason)
         journal.record_reconciliation(
             "operator_state_change",
@@ -499,11 +535,107 @@ def cmd_pause(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
-    return _set_state(args, SystemState.ACTIVE, "resume")
+    """Return to ACTIVE from PAUSE_ENTRIES - and only from there.
+
+    HALTED and KILLED both record a decision that trading should stop, and both
+    may have been set by code rather than by an operator. Undoing them here
+    would make the guards in :func:`cmd_unhalt` optional.
+    """
+    return _set_state(
+        args,
+        SystemState.ACTIVE,
+        "resume",
+        guarded=(SystemState.HALTED, SystemState.KILLED),
+    )
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
     return _set_state(args, SystemState.KILLED, "engage the kill switch")
+
+
+def cmd_unhalt(args: argparse.Namespace) -> int:
+    """Leave HALTED or KILLED after the operator has investigated.
+
+    Both states mean the system no longer trusts itself, so this refuses to be a
+    rubber stamp: no reason, a broken allocation invariant, or an order whose
+    true state is unknown all block it. The default destination is
+    PAUSE_ENTRIES, not ACTIVE, because resuming trading is a second decision and
+    should not arrive as a side effect of clearing a halt.
+    """
+    settings = _settings(args)
+    reason = args.reason
+    if not reason:
+        print(
+            "refusing to unhalt: --reason is required, and it should say what was"
+            " checked rather than that everything is fine",
+            file=sys.stderr,
+        )
+        return REFUSED
+
+    with _journal(settings) as journal:
+        state, why, since = journal.get_system_state()
+        if state not in (SystemState.HALTED, SystemState.KILLED):
+            print(f"system is {state.value}, not halted or killed; nothing to do")
+            return OK
+
+        try:
+            allocation = _ledger(settings, journal).state()
+        except CryptobotError as exc:
+            print(f"refusing to unhalt: {exc}", file=sys.stderr)
+            return REFUSED
+        if not allocation.invariant_holds:
+            print(
+                "refusing to unhalt: the allocation invariant is still broken"
+                f" (committed {allocation.committed} + reserved {allocation.reserved}"
+                f" > ceiling {allocation.ceiling})",
+                file=sys.stderr,
+            )
+            print(
+                "  record the correction with a `cryptobot ledger` review and an"
+                " explicit adjustment before resuming",
+                file=sys.stderr,
+            )
+            return REFUSED
+
+        unresolved = journal.list_orders(
+            [status for status in OrderStatus if status.needs_broker_confirmation],
+            limit=100,
+        )
+        if unresolved:
+            print(
+                f"refusing to unhalt: {len(unresolved)} order(s) still need broker"
+                " confirmation",
+                file=sys.stderr,
+            )
+            for record in unresolved[:5]:
+                print(
+                    f"  {record.client_order_id} {record.symbol}"
+                    f" {record.status.value}",
+                    file=sys.stderr,
+                )
+            print("  run `cryptobot reconcile` until every order is resolved", file=sys.stderr)
+            return REFUSED
+
+        target = SystemState.ACTIVE if args.active else SystemState.PAUSE_ENTRIES
+        journal.set_system_state(target, f"unhalted by operator: {reason}")
+        journal.record_reconciliation(
+            "operator_state_change",
+            "warning",
+            {
+                "from": state.value,
+                "to": target.value,
+                "reason": reason,
+                "halt_reason": why,
+                "halt_since": None if since is None else since.isoformat(),
+                "actor": "cli",
+            },
+        )
+        print(f"system state: {state.value} -> {target.value}")
+        print(f"  was {state.value}: {why}")
+        print(f"  reason: {reason}")
+        if target is SystemState.PAUSE_ENTRIES:
+            print("  new entries stay blocked; run `cryptobot resume --reason ...` to enable them")
+    return OK
 
 
 def cmd_cancel_all(args: argparse.Namespace) -> int:
@@ -693,6 +825,14 @@ def cmd_challengers(args: argparse.Namespace) -> int:
                         report.baseline_out_of_sample.total_return_pct
                     ),
                     "promoted": [verdict.as_dict() for verdict in report.promotable],
+                    "approval_required": [
+                        {
+                            "evidence": evidence.as_dict(),
+                            "digest": evidence.digest,
+                            "command": _promote_command(evidence),
+                        }
+                        for evidence in _promotion_evidence(report, args.strategy)
+                    ],
                     "verdicts": [verdict.as_dict() for verdict in report.verdicts],
                     "caveats": list(report.caveats),
                 },
@@ -701,7 +841,167 @@ def cmd_challengers(args: argparse.Namespace) -> int:
         )
     else:
         print(report.summary())
+        candidates = _promotion_evidence(report, args.strategy)
+        if candidates:
+            print()
+            print("  APPROVAL REQUIRED - nothing has been changed by this command")
+            for evidence in candidates:
+                print(f"  {evidence.strategy} {dict(evidence.params)}")
+                print(f"    digest {evidence.digest}")
+                print(f"    {_promote_command(evidence)}")
     return OK
+
+
+def _promotion_evidence(report: ChallengerReport, strategy: str) -> list[Evidence]:
+    """The approved-shape evidence for each promotable challenger.
+
+    Built here so the digest the operator is asked to confirm is computed from
+    the same numbers the report was built from, not from the rounded display
+    values.
+    """
+    return [
+        evidence_from(report, verdict, strategy=strategy)
+        for verdict in report.promotable
+    ]
+
+
+def _promote_command(evidence: Evidence) -> str:
+    """The exact command that records an approval of this evidence."""
+    parts = ["cryptobot", "promote", "--strategy", evidence.strategy]
+    for key, value in evidence.params.items():
+        parts += ["--param", f"{key}={value}"]
+    parts += [
+        "--oos-return-pct",
+        format(evidence.out_of_sample_return_pct, "f"),
+        "--oos-drawdown-pct",
+        format(evidence.out_of_sample_drawdown_pct, "f"),
+        "--oos-trades",
+        str(evidence.out_of_sample_trades),
+        "--baseline-return-pct",
+        format(evidence.baseline_return_pct, "f"),
+        "--evidence",
+        evidence.digest,
+        "--approve-by",
+        '"YOUR NAME"',
+        "--reason",
+        '"why this change is justified"',
+    ]
+    return " ".join(parts)
+
+
+def cmd_promote(args: argparse.Namespace) -> int:
+    """Record a human approval of one strategy configuration.
+
+    This command never edits configuration and never trades: it refuses to run
+    without a named approver, a reason, and the digest of the evidence they were
+    shown, and then appends that decision to the journal. Applying the change is
+    a separate, deliberate edit.
+    """
+    settings = _settings(args)
+    try:
+        strategy_class(args.strategy)
+    except CryptobotError as exc:
+        print(f"refusing to promote an unknown strategy: {exc}", file=sys.stderr)
+        return REFUSED
+
+    evidence = Evidence(
+        strategy=args.strategy,
+        params=_parse_params(args.param),
+        out_of_sample_return_pct=Decimal(str(args.oos_return_pct)),
+        out_of_sample_drawdown_pct=Decimal(str(args.oos_drawdown_pct)),
+        out_of_sample_trades=int(args.oos_trades),
+        baseline_return_pct=Decimal(str(args.baseline_return_pct)),
+    )
+    try:
+        promotion = approve(
+            evidence,
+            approved_by=args.approve_by or "",
+            reason=args.reason or "",
+            approved_at=datetime.now(timezone.utc),
+            expect_digest=args.evidence,
+        )
+    except PromotionRefused as exc:
+        print(f"refusing to record a promotion: {exc}", file=sys.stderr)
+        return REFUSED
+
+    if args.dry_run:
+        print(promotion.summary())
+        print("  (dry run: nothing was recorded)")
+        return OK
+
+    with _journal(settings) as journal:
+        existing = journal.find_promotion(promotion.digest)
+        if existing is not None:
+            print(
+                f"this evidence is already approved as promotion"
+                f" {existing['promotion_id']} by {existing['approved_by']}; nothing to do"
+            )
+            return OK
+        promotion_id = promotion.record(journal)
+
+    print(promotion.summary())
+    print(f"  recorded      promotion {promotion_id}")
+    return OK
+
+
+def cmd_env_hint(args: argparse.Namespace) -> int:
+    """Print the shell syntax for setting credentials - names only, no values.
+
+    This exists because telling someone to "put your key in the environment" is
+    where setup usually stalls, and because the honest way to help is to show the
+    variable names without ever touching, echoing, or storing a value.
+    """
+    settings = _settings(args)
+    names = [
+        (settings.alpaca.api_key_env, "Alpaca paper key id (required)"),
+        (settings.alpaca.api_secret_env, "Alpaca paper secret (required)"),
+        ("CRYPTOBOT_TELEGRAM_BOT_TOKEN", "Telegram token (optional)"),
+        ("CRYPTOBOT_TELEGRAM_CHAT_ID", "Telegram chat id (optional)"),
+    ]
+    missing = settings.alpaca.missing_credential_names()
+
+    print("CRYPTOBOT environment (names only; values are never read or printed)")
+    print()
+    for name, purpose in names:
+        print(f"  {name:<34}{'set' if _is_set(name) else 'NOT SET':<9}{purpose}")
+    print()
+    if missing:
+        print(
+            f"  {len(missing)} required variable(s) unset: {', '.join(missing)}"
+            " - `cryptobot preflight` fails until they are set"
+        )
+        print()
+    print("Set them in the shell that will run the bot, then start a new terminal")
+    print("if you used a permanent form. Values typed here are not logged.")
+    print()
+    if args.shell == "powershell":
+        print("PowerShell (current session only):")
+        for name, _ in names[:2]:
+            print(f'  $env:{name} = "..."')
+        print()
+        print("PowerShell (persist for your user):")
+        for name, _ in names[:2]:
+            print(f'  [Environment]::SetEnvironmentVariable("{name}", "...", "User")')
+    else:
+        print("Bash / zsh (current session only):")
+        for name, _ in names[:2]:
+            print(f'  export {name}="..."')
+        print()
+        print("Bash / zsh (persist): append those lines to ~/.profile or ~/.bashrc")
+    print()
+    print("Never commit these values; `.env` is gitignored and `.env.example`")
+    print("holds placeholders only. If a key is exposed, rotate it in the Alpaca")
+    print("dashboard rather than editing it out of a file.")
+    return OK
+
+
+def _is_set(name: str) -> bool:
+    """Whether an environment variable is present and non-empty.
+
+    Only the presence is ever inspected: the value is never read into a string
+    that could be printed, logged, or persisted.
+    """
+    return bool(os.environ.get(name))
 
 
 def cmd_trade_report(args: argparse.Namespace) -> int:
@@ -719,6 +1019,61 @@ def cmd_trade_report(args: argparse.Namespace) -> int:
     print(trades.summary())
     print()
     print(execution.summary())
+    return OK
+
+
+def cmd_soak(args: argparse.Namespace) -> int:
+    """Soak evidence: what the journal can prove about uptime."""
+    settings = _settings(args)
+    action = args.action or "status"
+    with _journal(settings) as journal:
+        note = ""
+        if action == "start":
+            window = journal.open_soak_window(
+                args.note or "", interval_seconds=float(args.interval)
+            )
+            journal.record_soak_event(
+                window["window_id"], "window_declared", "soak start declared by the operator"
+            )
+            note = (
+                f"window {window['window_id']} open since {window['started_at']}"
+                " - heartbeats accumulate while `paper-run` is running"
+            )
+        elif action == "close":
+            closed = journal.close_soak_window(args.reason or "operator")
+            note = f"{closed} soak window(s) closed; no further heartbeats will join them"
+        coverage = compute_coverage(journal)
+        summaries = (
+            daily_summaries(journal)
+            if action == "daily" or args.daily
+            else []
+        )
+        events = journal.soak_events(coverage.window_id, limit=int(args.events))
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "coverage": coverage.as_dict(),
+                    "daily": [summary.__dict__ for summary in summaries],
+                    "events": [dict(event) for event in events],
+                },
+                indent=2,
+            )
+        )
+        return OK
+    if note:
+        print(note)
+        print()
+    print(coverage.describe())
+    if summaries:
+        print()
+        print(daily_report(summaries, limit=int(args.days)))
+    if events:
+        print()
+        print("SOAK EVENTS")
+        for event in events[-20:]:
+            print(f"  {event['ts']}  {event['kind']:<18}{event['detail']}")
     return OK
 
 
@@ -865,6 +1220,24 @@ def build_parser() -> argparse.ArgumentParser:
     rec = add("reconcile", cmd_reconcile, "compare local state with the broker")
     rec.add_argument("--mode", choices=["simulated", "paper"], default="simulated")
 
+    soak = add("soak", cmd_soak, "soak evidence: coverage, gaps, restarts, daily summaries")
+    soak.add_argument(
+        "action",
+        nargs="?",
+        choices=("status", "start", "close", "daily"),
+        default="status",
+        help="status (default), start, close, or daily",
+    )
+    soak.add_argument("--note", default="", help="note stored with a new window")
+    soak.add_argument("--reason", default="", help="reason recorded when closing")
+    soak.add_argument(
+        "--interval", type=float, default=60.0, help="declared heartbeat interval (s)"
+    )
+    soak.add_argument("--events", type=int, default=20, help="soak events to show")
+    soak.add_argument("--days", type=int, default=30, help="days shown in the daily table")
+    soak.add_argument("--daily", action="store_true", help="include daily summaries")
+    soak.add_argument("--json", action="store_true")
+
     pause = add("pause", cmd_pause, "stop new entries, keep positions")
     pause.add_argument("--reason", required=False)
 
@@ -873,6 +1246,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     kill = add("kill", cmd_kill, "engage the kill switch")
     kill.add_argument("--reason", required=False)
+
+    unhalt_cmd = add(
+        "unhalt", cmd_unhalt, "leave HALTED or KILLED after investigating the cause"
+    )
+    unhalt_cmd.add_argument("--reason", required=False)
+    unhalt_cmd.add_argument(
+        "--active",
+        action="store_true",
+        help="enable entries as well (the default leaves them paused)",
+    )
 
     cancel = add("cancel-all", cmd_cancel_all, "cancel open orders (requires --yes)")
     cancel.add_argument("--mode", choices=["simulated", "paper"], default="paper")
@@ -935,6 +1318,31 @@ def build_parser() -> argparse.ArgumentParser:
     chal.add_argument("--min-improvement-pct", dest="min_improvement_pct", default="0")
     chal.add_argument("--drawdown-slack-pct", dest="drawdown_slack", default="1")
     chal.add_argument("--json", action="store_true")
+
+    promote = add(
+        "promote",
+        cmd_promote,
+        "record a human approval of one strategy configuration (never applies it)",
+    )
+    promote.add_argument("--strategy", required=True, help="strategy name from config")
+    promote.add_argument("--param", action="append", metavar="K=V")
+    promote.add_argument("--oos-return-pct", dest="oos_return_pct", required=True)
+    promote.add_argument("--oos-drawdown-pct", dest="oos_drawdown_pct", required=True)
+    promote.add_argument("--oos-trades", dest="oos_trades", type=int, required=True)
+    promote.add_argument("--baseline-return-pct", dest="baseline_return_pct", required=True)
+    promote.add_argument("--evidence", required=True, help="digest printed by challengers")
+    promote.add_argument("--approve-by", dest="approve_by", required=True)
+    promote.add_argument("--reason", required=True)
+    promote.add_argument("--dry-run", dest="dry_run", action="store_true")
+
+    env_hint = add(
+        "env-hint",
+        cmd_env_hint,
+        "print shell syntax for the credential variables (names only)",
+    )
+    env_hint.add_argument(
+        "--shell", choices=["powershell", "bash"], default="powershell"
+    )
 
     return parser
 

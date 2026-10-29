@@ -309,9 +309,15 @@ def reconstruct_symbol(
         if quantity <= ZERO:
             continue
         if fill.side is Side.BUY:
-            open_quantity += quantity
-            open_cost += quantity * fill.price
-            open_fees += fill.fee
+            # A crypto buy pays its fee out of the asset it is credited with, so
+            # the lot is the net quantity; ``fee_in_quote`` values the fee in the
+            # quote currency so that quantities, costs and fees never mix units.
+            held = fill.net_quantity
+            if held <= ZERO:
+                continue
+            open_quantity += held
+            open_cost += held * fill.price
+            open_fees += fill.fee_in_quote()
             opened_at = opened_at or fill.ts
             open_ids.append(fill.client_order_id)
             continue
@@ -328,7 +334,7 @@ def reconstruct_symbol(
         # Fees accumulated on the open lot are released pro rata, so a partially
         # closed position cannot hide fees in the remainder.
         entry_fees = open_fees * (matched / open_quantity)
-        exit_fees = fill.fee * (matched / quantity)
+        exit_fees = fill.fee_in_quote() * (matched / quantity)
         proceeds = matched * fill.price
 
         trades.append(

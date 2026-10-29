@@ -13,7 +13,9 @@ The rule enforced here is deliberately narrow and unflattering:
   than as a rejection, because the honest answer is "we do not know yet".
 
 Nothing here places orders, and nothing here writes to the live configuration.
-A promoted challenger is a recommendation an operator must apply deliberately.
+A promoted challenger is a recommendation an operator must apply deliberately,
+and :mod:`cryptobot.evaluation.promotion` is where that decision becomes an
+auditable object rather than a convention.
 """
 
 from __future__ import annotations
@@ -234,7 +236,8 @@ CAVEATS: tuple[str, ...] = (
     "out-of-sample here is a single chronological split, not repeated walk-forward; "
     "confirm any candidate with `cryptobot walk-forward` before promoting it",
     "costs are the configured constants; a real fee change invalidates the comparison",
-    "no challenger is promoted by this report; promotion is an operator action",
+    "no challenger is promoted by this report; an operator must record an"
+    " approval with `cryptobot promote` and then apply the change by hand",
 )
 
 

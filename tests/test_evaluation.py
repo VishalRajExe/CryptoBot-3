@@ -688,9 +688,12 @@ def test_an_empty_journal_is_not_accepted(journal: Journal, settings: Settings) 
 
 
 def test_duration_is_pending_not_failed_while_the_soak_runs(
-    journal: Journal, settings: Settings
+    journal: Journal, settings: Settings, soak
 ) -> None:
     _decision(journal, START)
+    # Three days of heartbeats. The window is the only thing that makes those
+    # three days measurable; elapsed wall clock alone would not.
+    soak(days=3, interval_hours=24.0)
 
     report = run_acceptance(
         journal, settings, criteria=_lenient(), now=START + timedelta(days=3)
@@ -703,9 +706,12 @@ def test_duration_is_pending_not_failed_while_the_soak_runs(
     assert "needs 27.0 more day(s)" in report.summary()
 
 
-def test_a_completed_sound_soak_is_accepted(journal: Journal, settings: Settings) -> None:
+def test_a_completed_sound_soak_is_accepted(
+    journal: Journal, settings: Settings, soak
+) -> None:
     for day in range(0, 31):
         _decision(journal, START + timedelta(days=day))
+    soak(days=30, interval_hours=24.0)
 
     report = run_acceptance(
         journal,

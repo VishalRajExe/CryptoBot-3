@@ -13,10 +13,14 @@ or an unaccounted order:
    the broker with the same ``client_order_id`` - never by resubmitting.
 7. Book fills to the ledger idempotently.
 
-Fees: the Orders API does not return per-fill fees (Alpaca posts crypto fees as
-``CFEE`` activities at end of day), so when a terminal order reports a filled
-quantity we book a single cumulative fill with the fee *estimated* from the
-configured reserve. See docs/API_CAPABILITIES.md, "Known estimation".
+Fees: the Orders API returns no per-fill fee. Alpaca charges a crypto fee on the
+*credited* asset (verified 2026-10-29, docs/API_CAPABILITIES.md §4): a buy is
+charged in the base asset, a sell in the quote asset, and the charge only appears
+as a ``CFEE``/``FEE`` account activity after the end of the trading day. Until
+then the fee on a recorded fill is an *estimate* at the configured reserve rate.
+:mod:`cryptobot.execution.fees` replaces it with the broker's actual figure when
+the activity posts; the estimate is deliberately the taker rate so that a
+maker-priced fill never leaves reservations under-funded.
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ from cryptobot.core.contracts import (
     OrderStatus,
     RiskVerdict,
     Side,
+    credited_currency,
+    quote_currency,
     to_decimal,
 )
 from cryptobot.core.errors import (
@@ -46,6 +52,7 @@ from cryptobot.core.errors import (
     RiskRejected,
 )
 from cryptobot.core.logging import get_logger
+from cryptobot.core.states import SystemState
 from cryptobot.execution.base import BrokerOrder, ExecutionAdapter
 from cryptobot.journal.store import Journal
 from cryptobot.sizing.ledger import AllocationLedger
@@ -53,7 +60,6 @@ from cryptobot.sizing.ledger import AllocationLedger
 log = get_logger(__name__)
 
 UTC = timezone.utc
-CUMULATIVE_FILL_ID = "cum-final"
 
 
 def _utcnow() -> datetime:
@@ -265,6 +271,7 @@ class OrderService:
             )
 
         self._book_fills(broker_order, intent)
+        self._flag_over_deployment(intent)
         record = self._write_record(
             intent,
             broker_order.status,
@@ -278,28 +285,52 @@ class OrderService:
         self.sync_reservation(record, intent)
         return record
 
+    def _flag_over_deployment(self, intent: OrderIntent) -> None:
+        """Record and halt when fills cost more than the reservation covered.
+
+        A reservation is a forecast: notional plus a fee and slippage buffer. A
+        gap up between sizing and execution can still make a fill cost more, and
+        by then the money has left the account, so the ledger books it and
+        ``committed`` exceeds ``ceiling``. That is a budget breach whoever caused
+        it, and the response is an explicit record plus ``HALTED`` rather than a
+        silently over-committed ledger: ``HALTED`` withdraws ``allow_new_entries``
+        (see :class:`cryptobot.core.states.Capabilities`), so no further position
+        can be opened while the operator unwinds this one.
+
+        Firing here rather than inside the ledger keeps the ledger an accountant:
+        it records what happened, and the order path decides what that means.
+        """
+        state = self._ledger.state()
+        if state.invariant_holds:
+            return
+
+        over_by = state.allocated - state.ceiling
+        detail = {
+            "client_order_id": intent.client_order_id,
+            "symbol": intent.symbol,
+            "committed": format(state.committed, "f"),
+            "reserved": format(state.reserved, "f"),
+            "ceiling": format(state.ceiling, "f"),
+            "over_by": format(over_by, "f"),
+        }
+        self._journal.record_reconciliation("allocation_breach", "critical", detail)
+        self._journal.set_system_state(
+            SystemState.HALTED,
+            f"allocation breach on {intent.client_order_id}: "
+            f"committed {detail['committed']} + reserved {detail['reserved']} "
+            f"exceeds the {detail['ceiling']} ceiling by {detail['over_by']}; "
+            "investigate and unwind before unhalting",
+        )
+        log.critical(
+            "allocation ceiling breached by a fill; new entries halted",
+            extra={"context": detail},
+        )
+
     def _book_fills(self, broker_order: BrokerOrder, intent: OrderIntent) -> None:
         fills: list[FillRecord] = list(broker_order.fills)
 
-        if not fills and broker_order.status.is_terminal and broker_order.filled_quantity > 0:
-            price = broker_order.avg_fill_price
-            if price is None:
-                price = intent.notional / intent.quantity
-            notional = broker_order.filled_quantity * price
-            fills.append(
-                FillRecord(
-                    fill_id=CUMULATIVE_FILL_ID,
-                    broker_order_id=broker_order.broker_order_id or broker_order.client_order_id,
-                    client_order_id=broker_order.client_order_id,
-                    symbol=broker_order.symbol,
-                    side=broker_order.side,
-                    quantity=broker_order.filled_quantity,
-                    price=price,
-                    fee=notional * self._fee_fraction,
-                    fee_currency=broker_order.symbol.split("/")[1],
-                    ts=self._clock(),
-                )
-            )
+        if not fills:
+            fills = self._synthesise_fill_delta(broker_order, intent)
 
         if not fills:
             return
@@ -311,8 +342,10 @@ class OrderService:
             if fill.side is Side.BUY:
                 self._journal.record_fill(fill)
                 self._ledger.release(fill.client_order_id, note="buy fill")
+                # ``net_quantity`` is the quantity the account is credited with: a
+                # crypto buy pays its fee out of the asset it just received.
                 self._ledger.commit_buy(
-                    fill.client_order_id, fill.quantity, fill.price, fill.fee_in_quote()
+                    fill.client_order_id, fill.net_quantity, fill.price, fill.fee_in_quote()
                 )
             else:
                 _, average_before = self._journal.realized_position(fill.symbol)
@@ -326,6 +359,64 @@ class OrderService:
                     average_before,
                 )
             existing.add(fill.fill_id)
+
+    def _synthesise_fill_delta(
+        self, broker_order: BrokerOrder, intent: OrderIntent
+    ) -> list[FillRecord]:
+        """Book whatever has been filled since the last recorded fill.
+
+        The Orders API reports a *cumulative* ``filled_qty``; the individual fills
+        are only available from a separate endpoint. Booking the cumulative figure
+        on each poll would double count, so the delta against what this order has
+        already recorded is booked instead.
+
+        Booking deltas has a second effect that matters: a partially filled order
+        updates positions, the ledger and reservations immediately, rather than
+        waiting for a terminal status. An order that sits half-filled overnight is
+        then visible to reconciliation instead of looking like unbacked exposure.
+
+        The fee is estimated in the currency the broker actually charges it in.
+        """
+        cumulative = broker_order.filled_quantity
+        if cumulative <= 0:
+            return []
+
+        booked = sum(
+            (fill.quantity for fill in self._journal.fills_for(broker_order.client_order_id)),
+            Decimal("0"),
+        )
+        delta = cumulative - booked
+        if delta <= 0:
+            return []
+
+        price = broker_order.avg_fill_price
+        if price is None:
+            price = intent.notional / intent.quantity
+        notional = delta * price
+
+        fee_currency = credited_currency(broker_order.symbol, broker_order.side)
+        if fee_currency == quote_currency(broker_order.symbol):
+            # A fee denominated in what we receive as cash is a fraction of value.
+            fee = notional * self._fee_fraction
+        else:
+            # A fee denominated in the asset we receive is a fraction of quantity.
+            # Its quote value is the same either way: delta*f x price == notional*f.
+            fee = delta * self._fee_fraction
+
+        return [
+            FillRecord(
+                fill_id=f"cum-{format(cumulative, 'f')}",
+                broker_order_id=broker_order.broker_order_id or broker_order.client_order_id,
+                client_order_id=broker_order.client_order_id,
+                symbol=broker_order.symbol,
+                side=broker_order.side,
+                quantity=delta,
+                price=price,
+                fee=fee,
+                fee_currency=fee_currency,
+                ts=self._clock(),
+            )
+        ]
 
     def sync_reservation(self, record: OrderRecord, intent: OrderIntent) -> None:
         ref = record.client_order_id

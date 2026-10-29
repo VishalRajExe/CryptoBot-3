@@ -25,7 +25,7 @@ independent of whatever balance the paper account happens to display.
 
 | | |
 | --- | --- |
-| Test suite | **373 passed** — `python -m pytest tests -p no:cacheprovider --tb=short -rN` |
+| Test suite | **501 passed** in `.venv`; **468 passed, 1 skipped** on an interpreter without `alpaca-py` — `python -m pytest` |
 | Runs without network | yes |
 | Runs without credentials | yes |
 | Runtime dependencies | standard library + `PyYAML` |
@@ -133,6 +133,7 @@ Every command accepts `--config PATH` and `-v`.
 | Command | Purpose |
 | --- | --- |
 | `config-check` | validate configuration, print public values only |
+| `env-hint` | shell syntax for the credential variables (names only, never values) |
 | `status` | allocation, positions, orders, recent decisions |
 | `ledger` | allocation ledger events and live reservations |
 | `orders` | recorded orders |
@@ -146,8 +147,9 @@ Every command accepts `--config PATH` and `-v`.
 | `paper-run` | continuous paper loop; orders only with `--submit` |
 | `reconcile` | compare local state with the broker |
 | `pause` | stop new entries, keep positions (requires `--reason`) |
-| `resume` | return to active trading |
+| `resume` | return to active trading; only from `PAUSE_ENTRIES` |
 | `kill` | engage the kill switch |
+| `unhalt` | leave `HALTED`/`KILLED` after investigating; goes to `PAUSE_ENTRIES` |
 | `cancel-all` | cancel open orders (requires `--yes`) |
 | `dashboard` | read-only local dashboard |
 | `backtest` | single backtest with explicit costs |
@@ -155,7 +157,9 @@ Every command accepts `--config PATH` and `-v`.
 | `walk-forward` | chronological walk-forward folds |
 | `sensitivity` | one-factor-at-a-time sweep |
 | `challengers` | judge challenger parameters out-of-sample |
+| `promote` | record a human approval of one configuration; never applies it |
 | `trade-report` | evaluate recorded fills and measured slippage |
+| `soak` | soak window: start/close, coverage, gaps, restarts, daily summaries |
 | `acceptance` | soak acceptance criteria against the journal |
 | `ai-review` | shadow-mode AI assessment; never trades |
 
@@ -173,6 +177,7 @@ cryptobot-app/
 │   ├── API_CAPABILITIES.md      # verified Alpaca facts, each with a source
 │   ├── IMPLEMENTATION_ROADMAP.md
 │   ├── OPERATIONS.md
+│   ├── PAPER_TRADING_SETUP.md   # first-run procedure, credentials stay in the shell
 │   └── SOURCE_REFERENCES.md
 ├── src/cryptobot/
 │   ├── core/                    # contracts, errors, states, time, logging, transport
@@ -193,17 +198,23 @@ cryptobot-app/
 │   ├── runtime.py               # Runtime + TradingLoop
 │   ├── engine.py                # decision -> risk -> execution cycle
 │   └── cli.py
-├── tests/                       # 373 tests, all offline
+├── tests/                       # 501 tests, all offline
 └── IMPLEMENTATION_CHECKLIST.md
 ```
 
 ## Testing
 
 ```powershell
-pytest                                   # 373 tests, no network, no credentials
+pytest                                   # 501 tests, no network, no credentials
 pytest tests/test_execution.py -q        # one module
 pytest -m "network or broker"            # opt-in; not run by default
 ```
+
+`tests/test_sdk_integration.py` drives `alpaca-py`'s own models over a fake
+transport, so it needs the `alpaca` extra; without it the module skips itself and
+everything else still runs. Passing those tests proves our request construction
+and response parsing, **not** that a real paper order is accepted — that has not
+been performed.
 
 The `network` and `broker` markers exist so that anything which would contact
 Alpaca is opt-in. The default suite never places an order, never fetches a bar
@@ -235,6 +246,7 @@ over the network, and never reads a real credential.
 | [docs/API_CAPABILITIES.md](docs/API_CAPABILITIES.md) | verified Alpaca behaviour, and what is deliberately not implemented |
 | [docs/IMPLEMENTATION_ROADMAP.md](docs/IMPLEMENTATION_ROADMAP.md) | phase order and remaining work |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | runbook: states, failure handling, shutdown |
+| [docs/PAPER_TRADING_SETUP.md](docs/PAPER_TRADING_SETUP.md) | first run: credentials, preflight, dry cycles, soak, acceptance |
 | [docs/SOURCE_REFERENCES.md](docs/SOURCE_REFERENCES.md) | which reference repo informed what, and what was rejected |
 
 ## Licence

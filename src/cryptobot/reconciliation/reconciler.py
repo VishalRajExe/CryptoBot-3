@@ -36,6 +36,14 @@ UTC = timezone.utc
 QUANTITY_TOLERANCE = Decimal("0.00000001")
 VALUE_TOLERANCE = Decimal("0.01")
 
+#: How far a position may differ before it is treated as unexplained drift.
+#: A crypto buy is charged its fee in the base asset, so the local holding and the
+#: broker's reported quantity can legitimately differ by one fee. Treating that as
+#: critical would halt the bot on its first real trade; tolerating *twice* the fee
+#: budget still catches anything material, because a missing or duplicated fill is
+#: tens of percent of the position, not 25 basis points.
+DEFAULT_FEE_TOLERANCE = Decimal("0.0025")
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
@@ -92,6 +100,7 @@ class Reconciler:
         order_service: OrderService,
         *,
         grace_seconds: int = 120,
+        fee_tolerance_fraction: Decimal = DEFAULT_FEE_TOLERANCE,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._journal = journal
@@ -99,6 +108,7 @@ class Reconciler:
         self._adapter = adapter
         self._orders = order_service
         self._grace_seconds = grace_seconds
+        self._fee_tolerance = to_decimal(fee_tolerance_fraction, "fee_tolerance_fraction")
         self._clock = clock
 
     def reconcile(self, *, context: str = "periodic", halt_on_critical: bool = True) -> ReconciliationReport:
@@ -152,7 +162,10 @@ class Reconciler:
             local_qty, local_avg = self._journal.realized_position(symbol)
             broker = broker_by_symbol.get(symbol)
             broker_qty = broker.quantity if broker else Decimal("0")
-            if abs(local_qty - broker_qty) > QUANTITY_TOLERANCE:
+            quantity_tolerance = max(
+                QUANTITY_TOLERANCE, abs(broker_qty) * self._fee_tolerance * 2
+            )
+            if abs(local_qty - broker_qty) > quantity_tolerance:
                 drifts.append(
                     Drift(
                         "position_mismatch",
@@ -168,10 +181,11 @@ class Reconciler:
 
         # 3. ledger committed capital vs broker position cost basis
         broker_cost = sum(
-            (p.quantity * p.avg_entry_price for p in broker_positions), Decimal("0")
+            (p.reported_cost_basis for p in broker_positions), Decimal("0")
         )
         committed = self._ledger.state().committed
-        if abs(committed - broker_cost) > VALUE_TOLERANCE:
+        value_tolerance = max(VALUE_TOLERANCE, abs(broker_cost) * self._fee_tolerance * 2)
+        if abs(committed - broker_cost) > value_tolerance:
             drifts.append(
                 Drift(
                     "ledger_position_mismatch",

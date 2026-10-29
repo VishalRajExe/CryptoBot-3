@@ -80,6 +80,42 @@ def ledger(journal: Journal) -> AllocationLedger:
     return book
 
 
+@pytest.fixture
+def soak(journal: Journal, clock: "Clock"):
+    """Write soak evidence: one window, one process, regularly spaced heartbeats.
+
+    The clock is advanced between heartbeats rather than passed in, because that
+    is what a real run looks like: the only thing that moves is time.
+    """
+    from cryptobot.soak import SoakRecorder
+
+    def _instrument(
+        *,
+        days: int = 30,
+        interval_hours: float = 24.0,
+        start: datetime = START,
+        api_errors: int = 0,
+        close: bool = True,
+    ) -> str:
+        clock.now = start
+        recorder = SoakRecorder(
+            journal, interval_seconds=Decimal(str(interval_hours * 3600))
+        )
+        window_id = recorder.start()
+        for index in range(api_errors):
+            recorder.record_api_error(f"synthetic api error {index}")
+        step = timedelta(hours=interval_hours)
+        recorder.checkpoint(cycles=0)
+        for index in range(1, days + 1):
+            clock.now = start + step * index
+            recorder.checkpoint(cycles=index)
+        if close:
+            recorder.close("instrumented")
+        return window_id
+
+    return _instrument
+
+
 # ---------------------------------------------------------------------------
 # builders
 # ---------------------------------------------------------------------------
