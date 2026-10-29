@@ -29,7 +29,8 @@ independent of whatever balance the paper account happens to display.
 | Runs without network | yes |
 | Runs without credentials | yes |
 | Runtime dependencies | standard library + `PyYAML` |
-| Paper soak (≥30 days) | **not started** — blocked on credentials and elapsed time |
+| Real paper trading | **one order**: a `market` buy of 0.000248437 BTC on 2026-10-29, filled, booked, and reconciled clean against the paper account |
+| Paper soak (≥30 days) | **not started** — it needs elapsed time, and clock time cannot be compressed honestly |
 
 Phase-by-phase detail, including the evidence for each claim and the defects
 found while verifying it, is in

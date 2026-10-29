@@ -38,8 +38,8 @@ Recorded 2026-10-29. Both interpreters, from `d:\CRYPTOBOT\cryptobot-app`.
 | Item | Value |
 | --- | --- |
 | Command | `python -m pytest` (no extra `-q`: `addopts` already sets it, and `-qq` suppresses the summary line) |
-| `.venv` (with `alpaca` extra) | **501 passed**, 1 warning, 12.47s |
-| System Python 3.14 (no `alpaca-py`) | **468 passed, 1 skipped**, 11.67s — the skip is `tests/test_sdk_integration.py`, which skips itself via `importorskip("alpaca")` |
+| `.venv` (with `alpaca` extra) | **510 passed**, 1 warning, 14.00s |
+| System Python 3.14 (no `alpaca-py`) | **477 passed, 1 skipped**, 12.66s — the skip is `tests/test_sdk_integration.py`, which skips itself via `importorskip("alpaca")` |
 | Network required by the suite | none |
 | Credentials required by the suite | none |
 | Runtime dependencies | standard library + `PyYAML` |
@@ -52,17 +52,17 @@ Per-module collection counts (`pytest --collect-only -q`):
 | `tests/test_core.py` | contracts, timeframes, states, journal schema, logging | 45 |
 | `tests/test_data_risk.py` | data validation/gaps/cache, ledger, risk manager | 56 |
 | `tests/test_strategy_research.py` | indicators, strategies, backtest, walk-forward, no look-ahead | 54 |
-| `tests/test_execution.py` | order lifecycle, simulator, paper adapter, recovery | 44 |
+| `tests/test_execution.py` | order lifecycle, simulator, paper adapter, recovery | 46 |
 | `tests/test_fees.py` | crypto fee attribution, currency side, partial fills | 22 |
-| `tests/test_system.py` | preflight, runtime, engine, loop, safe shutdown | 50 |
+| `tests/test_system.py` | preflight, runtime, engine, loop, safe shutdown | 54 |
 | `tests/test_ai_monitoring.py` | shadow AI, notifier, reports, dashboard | 44 |
-| `tests/test_cli.py` | every CLI command as the operator meets it | 45 |
-| `tests/test_evaluation.py` | trade evaluation, challengers, acceptance harness | 47 |
+| `tests/test_cli.py` | every CLI command as the operator meets it | 46 |
+| `tests/test_evaluation.py` | trade evaluation, challengers, acceptance harness | 49 |
 | `tests/test_soak.py` | soak windows, heartbeats, gaps, restarts, daily summaries | 21 |
 | `tests/test_promotion.py` | the human approval gate and its persistence | 20 |
 | `tests/test_ledger_stress.py` | the ceiling under concurrency, partials, cancels, corruption | 20 |
 | `tests/test_sdk_integration.py` | `alpaca-py` models and client against a mocked transport | 33 |
-| **Total** | | **501** |
+| **Total** | | **510** |
 
 ## Verification levels
 
@@ -71,9 +71,9 @@ turns into a claim nobody checked.
 
 | Level | What it proves | Performed? | Where the result is |
 | --- | --- | --- | --- |
-| **Unit, offline** | our logic against fixtures we control | **yes** — 468 tests, no network | this file, per phase |
+| **Unit, offline** | our logic against fixtures we control | **yes** — 477 tests, no network | this file, per phase |
 | **SDK-mocked** | our requests and parsing against `alpaca-py`'s own models, over a fake transport | **yes** — 33 tests | Phase 5 |
-| **Authenticated paper** | the broker accepts our orders, fills them, and reports fees | **NO** — no credentials in this environment | Phase 5, `BLOCKED BY EXTERNAL PREREQUISITE` |
+| **Authenticated paper** | the broker accepts our orders, fills them, and reports fees | **yes, once** — one buy submitted, filled, reconciled and reported against `paper-api.alpaca.markets`; no sell, no cancel, no uncertain recovery | Phase 5 |
 | **Soak** | continuous paper operation over a declared interval, with coverage evidence | **NO** — nothing has run yet | Phase 12, `BLOCKED BY EXTERNAL PREREQUISITE` |
 
 ---
@@ -134,16 +134,18 @@ on every open, so an older database gains the tables without losing rows.
 **Objective:** fetch and cache Alpaca crypto bars, validate them, and make a
 stale or gapped series impossible to trade on silently.
 
-**Status:** `COMPLETED AND VERIFIED` for validation, caching, import/export and
-synthetic data. **Live fetch:** `BLOCKED BY EXTERNAL PREREQUISITE` (credentials).
+**Status:** `COMPLETED AND VERIFIED`, including one live fetch against the real
+`data.alpaca.markets` endpoint on 2026-10-29 (`data-refresh --lookback 500`
+stored real BTC/USD hourly bars, and preflight's `data_freshness` check passed
+against them).
 
 | | |
 | --- | --- |
 | Deliverables | `data/alpaca_data.py`, `data/validation.py`, `data/instruments.py`, bar cache in the journal, `data-refresh` / `data-import` / `data-export` / `seed-demo` |
 | Dependencies | Phase 1 |
 | Tests | `tests/test_data_risk.py` (data subset), `tests/test_cli.py` (import/export/seed) |
-| Acceptance | pagination honoured via `next_page_token`; bars older than `market.max_bar_age_seconds` are refused by the risk manager; a gap is reported as a gap, never interpolated; zero volume from a quote-mid bar is accepted as legitimate |
-| Evidence | `pytest tests/test_data_risk.py` → 56 passed; `cryptobot seed-demo --bars 120` stores 120 rows and prints `SYNTHETIC DATA`; `cryptobot data-refresh` without credentials exits `2` with `refusing to fetch: missing credentials` |
+| Acceptance | pagination honoured via `next_page_token`; bars older than `market.max_bar_age_seconds` are refused by the risk manager; a gap is reported as a gap, never interpolated; zero volume from a quote-mid bar is accepted as legitimate; instrument metadata comes from `/v2/assets`, not a constant |
+| Evidence | `pytest tests/test_data_risk.py` → 56 passed; `cryptobot seed-demo --bars 120` stores 120 rows and prints `SYNTHETIC DATA`; `cryptobot data-refresh` without credentials exits `2` with `refusing to fetch: missing credentials`; with credentials it stored 500 real bars and `cryptobot run-once` reported no fallback warning, with `journal.get_instrument("BTC/USD")` showing the broker's `min_order_size=0.000012531` rather than the constant |
 
 Endpoint facts used here are recorded with sources in
 [docs/API_CAPABILITIES.md](docs/API_CAPABILITIES.md): `GET
@@ -216,17 +218,28 @@ matches how the broker actually charges.
 
 - `COMPLETED AND VERIFIED` against the simulator and against `alpaca-py` over a
   mocked transport (33 SDK tests).
-- `BLOCKED BY EXTERNAL PREREQUISITE` for authenticated paper submission: no
-  credentials here, so **no order has ever reached Alpaca from this project**.
+- `COMPLETED AND VERIFIED` **once, against the real paper API** (2026-10-29):
+  preflight passed all 10 checks, a `market` buy of 0.000248437 BTC was submitted
+  with `client_order_id=cb-f6a4712fefb896e`, filled at 80123.59, booked as
+  0.0002478159075 net of a base-asset fee, and reconciled clean against the
+  broker's own position and cost basis. `trade-report` measured +2.88 bps of
+  slippage and 0.0498 USD of fee.
+- Still unexercised against the real API, and therefore still unverified: a sell
+  (so a round trip, realised P&L, and a quote-denominated `FEE`), a cancel, an
+  `UNCERTAIN` submission recovered by polling, a partial fill, and the actual fee
+  activity — Alpaca posts those after the end of the trading day, so the 0.0498 is
+  still our estimate at the reserve rate.
+- `NOT IMPLEMENTED` by design: live trading, and any order type other than
+  `market`.
 
 | | |
 | --- | --- |
 | Deliverables | `execution/base.py` (adapter protocol), `execution/alpaca_paper.py`, `execution/service.py`, `execution/orders.py`, `execution/simulator.py`, `execution/fees.py` |
 | Dependencies | Phases 1, 4 |
-| Tests | `tests/test_execution.py` (44), `tests/test_fees.py` (22), `tests/test_sdk_integration.py` (33), `tests/test_system.py` (engine/loop subset) |
-| Acceptance (verified) | the trading client is constructed in exactly one module and always with `paper=True`; `client_order_id` is deterministic; an ambiguous submission becomes `UNCERTAIN` and is never retried; a rejection is recorded with its reason; risk-rejected intents never reach the broker |
-| Acceptance (not verified) | that a real paper account accepts these orders, that fills arrive with the fields we parse, and that the posted fee activity matches our estimate |
-| Evidence | `pytest tests/test_execution.py tests/test_fees.py tests/test_sdk_integration.py` green in the `.venv`; the same invocation on system Python skips the SDK module (1 skip) because `alpaca-py` is absent |
+| Tests | `tests/test_execution.py` (46), `tests/test_fees.py` (22), `tests/test_sdk_integration.py` (33), `tests/test_system.py` (engine/loop subset) |
+| Acceptance (verified) | the trading client is constructed in exactly one module and always with `paper=True`; `client_order_id` is deterministic; an ambiguous submission becomes `UNCERTAIN` and is never retried; a rejection is recorded with its reason; risk-rejected intents never reach the broker; a real paper account accepts a `market` buy, reports it filled, and its position and cost basis agree with the ledger |
+| Acceptance (not verified) | that a real paper account accepts a **sell**, a **cancel**, or a **partial** fill; that a posted fee activity matches the estimate; and that an `UNCERTAIN` submission can be resolved against the live API |
+| Evidence | `pytest tests/test_execution.py tests/test_fees.py tests/test_sdk_integration.py` green in the `.venv`; the same invocation on system Python skips the SDK module (1 skip) because `alpaca-py` is absent. Live: `cryptobot preflight --mode paper` → 10 checks, 0 failures; `cryptobot reconcile` → `reconciliation clean against alpaca-paper (0 order(s), 1 position(s), 0 recovered)`; `cryptobot trade-report` → 1 filled order, +2.88 bps, fees (quote) 0.0498 |
 
 **Order-lifecycle order of operations** (`OrderService.apply_broker_order`):
 resolve intent → book fills → flag over-deployment → write the order record →
@@ -455,13 +468,28 @@ catches it, records a failed criterion, and continues evaluating the rest.
 
 ---
 
+## Defects found by the first authenticated run
+
+Four, all fixed with regression tests. Each is a case where a green test suite
+was hiding a wrong answer, which is the reason this section exists.
+
+| Defect | What it did | Fix, and the test that now holds it |
+| --- | --- | --- |
+| `reconcile` and `run-once` defaulted to `--mode simulated` | the routine commands compared the funded paper account against an empty in-memory simulator, reported `position_mismatch` + `ledger_position_mismatch`, and halted a healthy journal — twice, before it was noticed | both default to `paper`, like `paper-run` and `cancel-all`; the report names the broker it asked — `test_reconcile_asks_the_paper_broker_unless_told_otherwise` |
+| `position_snapshots.source` was written from a parameter that defaulted to `"broker"`, ignoring the snapshot's own source | every row said the same thing, so a journal could not be attributed to the adapter that wrote it and a paper-vs-simulator mix-up was undetectable | the store writes the snapshot's own source; the reconciler refuses a foreign one — `test_position_snapshots_remember_which_adapter_wrote_them`, `test_reconciling_against_a_different_broker_is_refused` |
+| `trade-report` valued execution fees in the charged asset | a BTC-denominated buy fee printed as `0.0000` beside USD P&L while the ledger had expensed 0.05 — two numbers for one fee, and the smaller one looked like "no fee" | every fee is valued in quote and the total says `fees (quote)` — `test_a_base_asset_buy_fee_is_reported_in_the_quote_currency` |
+| the engine never called `MarketDataService.instrument()` | sizing used hard-coded min-order and increment constants that the broker may have changed, disclosed only as a warning | fetched once per symbol from `/v2/assets` and cached in the journal, with the documented fallback only when the broker cannot be asked — `test_instrument_metadata_comes_from_the_broker_then_from_the_journal` |
+
+---
+
 ## External blockers
 
 | Blocker | Blocks | Effect today | What is still possible |
 | --- | --- | --- | --- |
-| No Alpaca paper credentials in this environment | Phases 2 (live fetch), 5 (authenticated paper), 12 (the soak) | no real bar fetch, no real order, no soak window | everything else: simulator, mocked SDK, full suite, all research and evaluation |
+| No paper credentials were available until 2026-10-29 | Phases 2 (live fetch), 5 (authenticated paper), 12 (the soak) | **partly lifted:** credentials were supplied in the shell, real bars were fetched and one real order was placed; they are not stored in the repository and are never printed | a second order, and every soak-day that follows |
 | No elapsed soak time | Phase 12 | acceptance reports `PENDING`, never `PASS` | running the harness, and every criterion it evaluates |
-| No `alpaca-py` in the system interpreter | Phase 5 (SDK-level) | the SDK module skips itself; nothing else degrades | the 468 tests that need no SDK |
+| No `alpaca-py` in the system interpreter | Phase 5 (SDK-level) | the SDK module skips itself; nothing else degrades | the 477 tests that need no SDK |
+| The paper account holds an open position closed only by a signal | a verified round trip | the ledger shows committed capital and an unrealised mark; no realisation has been booked against the broker yet | placing a sell when the strategy says so, or flattening by hand and reconciling |
 
 ---
 
@@ -495,6 +523,10 @@ short:
    needed (gaps are recorded, not smoothed).
 7. `cryptobot acceptance --days 30` — until that prints `ACCEPTED`, Phase 12 is
    incomplete and this file must keep saying `BLOCKED BY EXTERNAL PREREQUISITE`.
+
+Steps 1-4 have been performed against the real paper account. Step 5 was performed
+with `run-once --submit` and one order, not the loop. Steps 6-7 have not been
+started.
 
 ---
 
