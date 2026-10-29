@@ -1,0 +1,74 @@
+# CRYPTOBOT configuration.
+#
+# There is deliberately NO live-trading switch. `alpaca.trading_base_url` is
+# validated against a paper-only allowlist at load time; any other value is a
+# hard configuration error. See docs/API_CAPABILITIES.md for the verified
+# Alpaca facts this file depends on.
+
+app:
+  name: cryptobot
+  # Only accepted value. Present so misconfiguration is loud, not silent.
+  environment: paper
+
+allocation:
+  # Hard ceiling of capital the application may deploy, independent of the
+  # (larger) balance Alpaca displays for the paper account.
+  ceiling_usd: 100
+  # Realized profit never raises the ceiling. It is reported, not re-deployed.
+
+alpaca:
+  # Paper-only endpoint. Must match the allowlist in src/cryptobot/config/settings.py
+  trading_base_url: https://paper-api.alpaca.markets
+  data_base_url: https://data.alpaca.markets
+  # Crypto market data location segment: /v1beta3/crypto/{loc}/bars
+  crypto_location: us
+  api_key_env: ALPACA_API_KEY
+  api_secret_env: ALPACA_API_SECRET_KEY
+  request_timeout_seconds: 20
+  max_retries: 3
+
+market:
+  symbols:
+    - BTC/USD
+  timeframe: 1h
+  # Bars older than this are refused by the risk manager (stale data guard).
+  max_bar_age_seconds: 7200
+  # How many bars to load per decision cycle.
+  lookback_bars: 200
+
+strategy:
+  name: sma_cross
+  params:
+    fast_period: 12
+    slow_period: 48
+
+risk:
+  max_position_pct: 25          # per-position notional as % of allocation ceiling
+  max_total_exposure_pct: 100   # aggregate committed + reserved as % of ceiling
+  per_trade_risk_pct: 20        # notional cap per single order, % of ceiling
+  daily_loss_limit_pct: 5       # stop new entries after -5% of ceiling realized today
+  max_drawdown_pct: 12          # halt entries if equity drops this far from peak
+  fee_reserve_bps: 25           # taker fee reserve (verified tier-1 taker = 25 bps)
+  slippage_reserve_bps: 25
+  max_orders_per_day: 6
+  max_spread_bps: 50
+  symbol_allowlist:
+    - BTC/USD
+
+execution:
+  order_type: market
+  # Crypto supports gtc and ioc ONLY. `day` is invalid for crypto orders.
+  time_in_force: gtc
+  max_retries: 3
+  retry_backoff_seconds: 1.5
+  # Grace period before an unconfirmed order is declared LOST.
+  lost_order_grace_seconds: 120
+
+journal:
+  path: var/cryptobot.db
+
+monitoring:
+  dashboard_enabled: false
+  dashboard_host: 127.0.0.1
+  dashboard_port: 8787
+  telegram_enabled: false

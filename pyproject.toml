@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cryptobot"
+version = "0.1.0"
+description = "Paper-only AI-assisted cryptocurrency trading platform (Alpaca paper trading)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary - personal research project" }
+authors = [{ name = "CRYPTOBOT" }]
+
+# The core runtime intentionally depends on the standard library plus PyYAML only.
+# Broker order submission requires the optional `alpaca` extra; it is imported
+# lazily so that the whole core test suite runs with no network and no SDK.
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+alpaca = ["alpaca-py>=0.30"]
+research = ["vectorbt>=0.28"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+cryptobot = "cryptobot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+pythonpath = ["src"]
+markers = [
+    "network: requires live network access (skipped by default)",
+    "broker: requires broker credentials (skipped by default)",
+]
