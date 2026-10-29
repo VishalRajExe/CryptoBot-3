@@ -25,7 +25,7 @@ independent of whatever balance the paper account happens to display.
 
 | | |
 | --- | --- |
-| Test suite | **501 passed** in `.venv`; **468 passed, 1 skipped** on an interpreter without `alpaca-py` — `python -m pytest` |
+| Test suite | **510 passed** in `.venv`; **477 passed, 1 skipped** on an interpreter without `alpaca-py` — `python -m pytest` |
 | Runs without network | yes |
 | Runs without credentials | yes |
 | Runtime dependencies | standard library + `PyYAML` |
@@ -104,15 +104,18 @@ markets**, and the command says so every time it is used.
 ### 2. Local dry run (no broker, no credentials)
 
 ```powershell
-cryptobot seed-demo --bars 600      # SYNTHETIC bars, for plumbing only
-cryptobot run-once                  # one decision cycle; no orders
-cryptobot run-once --submit         # route approved intents to the simulator
+cryptobot seed-demo --bars 600          # SYNTHETIC bars, for plumbing only
+cryptobot run-once --mode simulated     # one decision cycle; no orders
+cryptobot run-once --mode simulated --submit   # route approved intents to the simulator
 cryptobot status
 cryptobot trade-report
 ```
 
-`run-once` without `--submit` is a pure evaluation: it records the decision and
-the risk verdict, and sends nothing anywhere.
+`--mode simulated` is explicit because the default is the paper broker, as it is
+for `paper-run` and `cancel-all`: those commands compare their result with the
+account, and a fresh simulator always looks empty. `run-once` without `--submit`
+is otherwise a pure evaluation: it records the decision and the risk verdict, and
+sends nothing anywhere.
 
 ### 3. Alpaca paper trading
 
@@ -143,7 +146,7 @@ Every command accepts `--config PATH` and `-v`.
 | `data-refresh` | fetch and cache bars from Alpaca |
 | `data-import` / `data-export` | move bars to and from JSON/CSV |
 | `seed-demo` | store **synthetic** bars (offline demo only) |
-| `run-once` | evaluate one cycle; orders only with `--submit` |
+| `run-once` | evaluate one cycle; orders only with `--submit`; `--mode` defaults to `paper` |
 | `paper-run` | continuous paper loop; orders only with `--submit` |
 | `reconcile` | compare local state with the broker |
 | `pause` | stop new entries, keep positions (requires `--reason`) |
@@ -198,14 +201,14 @@ cryptobot-app/
 │   ├── runtime.py               # Runtime + TradingLoop
 │   ├── engine.py                # decision -> risk -> execution cycle
 │   └── cli.py
-├── tests/                       # 501 tests, all offline
+├── tests/                       # 510 tests, all offline
 └── IMPLEMENTATION_CHECKLIST.md
 ```
 
 ## Testing
 
 ```powershell
-pytest                                   # 501 tests, no network, no credentials
+pytest                                   # 510 tests, no network, no credentials
 pytest tests/test_execution.py -q        # one module
 pytest -m "network or broker"            # opt-in; not run by default
 ```

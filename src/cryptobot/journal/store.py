@@ -786,9 +786,14 @@ class Journal:
         ).fetchall()
         return [str(r["day"]) for r in rows]
 
-    def save_position_snapshots(
-        self, snapshots: Iterable[PositionSnapshot], source: str = "broker"
-    ) -> None:
+    def save_position_snapshots(self, snapshots: Iterable[PositionSnapshot]) -> None:
+        """Persist position snapshots, keeping the source each one names.
+
+        The source column used to be written from a parameter defaulting to
+        ``"broker"``, so every row said the same thing and the reconciler could
+        not tell which adapter a journal belonged to. The snapshot carries the
+        adapter's own name; that is what is stored.
+        """
         with self.transaction() as conn:
             for snap in snapshots:
                 row = snap.to_row()
@@ -806,7 +811,7 @@ class Journal:
                         row["last_price"],
                         row["market_value"],
                         row["unrealized_pnl"],
-                        source,
+                        row["source"],
                     ),
                 )
 

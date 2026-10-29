@@ -28,11 +28,12 @@ from cryptobot.config.settings import APP_ROOT, Settings
 from cryptobot.core.contracts import (
     Action,
     Bar,
+    InstrumentSpec,
     OrderRecord,
     OrderStatus,
     StrategySignal,
 )
-from cryptobot.core.errors import HaltedError
+from cryptobot.core.errors import DataError, HaltedError
 from cryptobot.core.states import Capabilities, Severity, SystemState, capabilities_for
 from cryptobot.data.alpaca_data import MarketDataService
 from cryptobot.engine import TradingEngine
@@ -833,3 +834,86 @@ def test_bar_freshness_is_measured_against_the_decision_clock() -> None:
     assert bar.is_closed(now)
     assert bar.age_seconds(now) == pytest.approx(0, abs=1)
     assert not make_bars(["100"], start=now)[0].is_closed(now)
+
+
+# ---------------------------------------------------------------------------
+# instrument metadata
+# ---------------------------------------------------------------------------
+
+
+class _AssetSource:
+    """Serves one instrument spec and counts how often it was asked."""
+
+    def __init__(self, spec: InstrumentSpec | None = None, error: Exception | None = None):
+        self._spec = spec
+        self._error = error
+        self.calls = 0
+
+    def get_instrument(self, symbol: str) -> InstrumentSpec:
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        assert self._spec is not None
+        return self._spec
+
+
+def _engine_with_assets(settings, journal, ledger, clock, source) -> TradingEngine:
+    adapter = LocalSimulatorAdapter(starting_cash=ledger.ceiling, clock=clock)
+    orders = OrderService(journal, ledger, adapter, clock=clock)
+    data = MarketDataService(settings, journal, source, clock=clock)
+    return TradingEngine(
+        settings,
+        journal,
+        ledger,
+        _Scripted(Action.HOLD),
+        RiskManager(settings.risk),
+        orders,
+        data,
+        clock=clock,
+    )
+
+
+def test_instrument_metadata_comes_from_the_broker_then_from_the_journal(
+    settings, journal, ledger, clock
+) -> None:
+    spec = InstrumentSpec(
+        symbol="BTC/USD",
+        min_order_size="0.001",
+        min_trade_increment="0.0001",
+        price_increment="0.5",
+    )
+    source = _AssetSource(spec)
+    engine = _engine_with_assets(settings, journal, ledger, clock, source)
+
+    first = engine.instrument("BTC/USD")
+    second = engine.instrument("BTC/USD")
+
+    assert format(first.min_order_size, "f") == "0.001", "the broker's figure, not the constant"
+    assert format(second.price_increment, "f") == "0.5"
+    assert source.calls == 1, "the journal is the cache"
+    assert journal.get_instrument("BTC/USD") is not None
+
+
+def test_instrument_metadata_falls_back_when_no_client_is_configured(
+    settings, journal, ledger, clock
+) -> None:
+    engine = _engine(settings, journal, ledger, clock)
+
+    spec = engine.instrument("BTC/USD")
+
+    assert spec is not None and spec.symbol == "BTC/USD"
+
+
+def test_an_assets_failure_does_not_abort_the_decision(settings, journal, ledger, clock) -> None:
+    source = _AssetSource(error=DataError("assets endpoint unavailable"))
+    engine = _engine_with_assets(settings, journal, ledger, clock, source)
+
+    spec = engine.instrument("BTC/USD")
+
+    assert spec is not None and spec.symbol == "BTC/USD", "a warning, not a crash"
+
+
+def test_an_unknown_symbol_still_has_no_metadata(settings, journal, ledger, clock) -> None:
+    engine = _engine(settings, journal, ledger, clock)
+
+    assert engine.instrument("DOGE/USD") is None

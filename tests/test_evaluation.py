@@ -63,6 +63,7 @@ def _fill(
     when: datetime,
     fee: str = "0",
     symbol: str = "BTC/USD",
+    fee_currency: str = "USD",
 ) -> FillRecord:
     return FillRecord(
         fill_id=fill_id,
@@ -74,6 +75,7 @@ def _fill(
         price=Decimal(price),
         ts=when,
         fee=Decimal(fee),
+        fee_currency=fee_currency,
     )
 
 
@@ -394,6 +396,7 @@ def _recorded_order(
     limit_price: str | None = None,
     fill_price: str = "1000",
     fee: str = "0.05",
+    fee_currency: str = "USD",
     client_order_id: str = "cb-order-1",
 ) -> None:
     intent = make_intent(
@@ -425,8 +428,30 @@ def _recorded_order(
             price=fill_price,
             when=START,
             fee=fee,
+            fee_currency=fee_currency,
         )
     )
+
+
+def test_a_base_asset_buy_fee_is_reported_in_the_quote_currency(journal: Journal) -> None:
+    """The broker charges a buy in BTC; the report is in USD, so convert."""
+    _recorded_order(
+        journal, fill_price="70000", fee="0.0000007", fee_currency="BTC"
+    )
+
+    report = evaluate_execution(journal)
+
+    assert report.orders[0].fees == Decimal("0.049")
+    assert report.fees == Decimal("0.049")
+    assert "0.0490" in report.summary(), "not 0.0000 next to a USD figure"
+
+
+def test_a_quote_asset_sell_fee_is_reported_as_charged(journal: Journal) -> None:
+    _recorded_order(
+        journal, side=Side.SELL, fill_price="70000", fee="0.05", fee_currency="USD"
+    )
+
+    assert evaluate_execution(journal).fees == Decimal("0.05")
 
 
 def test_a_buy_filled_above_the_reference_is_positive_slippage(journal: Journal) -> None:

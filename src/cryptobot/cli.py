@@ -1208,7 +1208,10 @@ def build_parser() -> argparse.ArgumentParser:
     seed.add_argument("--symbol")
 
     once = add("run-once", cmd_run_once, "evaluate one cycle (no orders unless --submit)")
-    once.add_argument("--mode", choices=["simulated", "paper"], default="simulated")
+    # Paper, like `paper-run` and `cancel-all`: this command reconciles against the
+    # broker at the end, and a fresh simulator would report drift that is not real.
+    # Offline demos pass `--mode simulated` explicitly.
+    once.add_argument("--mode", choices=["simulated", "paper"], default="paper")
     once.add_argument("--submit", action="store_true", help="route approved intents to the broker")
 
     paper = add("paper-run", cmd_paper_run, "continuous PAPER loop (orders only with --submit)")
@@ -1218,7 +1221,9 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--reconcile-every", dest="reconcile_every", type=int, default=5)
 
     rec = add("reconcile", cmd_reconcile, "compare local state with the broker")
-    rec.add_argument("--mode", choices=["simulated", "paper"], default="simulated")
+    # Paper, not simulated: a fresh simulator holds no positions, so the default
+    # used to answer "position_mismatch" for a healthy paper account and halt it.
+    rec.add_argument("--mode", choices=["simulated", "paper"], default="paper")
 
     soak = add("soak", cmd_soak, "soak evidence: coverage, gaps, restarts, daily summaries")
     soak.add_argument(

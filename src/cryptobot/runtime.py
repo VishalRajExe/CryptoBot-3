@@ -222,18 +222,21 @@ class Runtime:
     def capture_account(self) -> None:
         """Persist a balance and position snapshot; tolerate broker absence."""
         try:
+            # The adapter's own name, not "broker": a journal outlives the mode
+            # it was written in, and reconciliation refuses to compare one broker's
+            # state with another's (cryptobot.reconciliation.reconciler).
+            source = self.adapter.name
             account = self.adapter.account()
             self.journal.save_balance(
                 cash=account.cash,
                 equity=account.equity,
                 buying_power=account.buying_power,
                 non_marginable_buying_power=account.non_marginable_buying_power,
-                source="simulator" if self.adapter.is_simulated else "broker",
+                source=source,
             )
             positions = self.adapter.positions()
             snapshots = [
-                p.to_snapshot(self.journal.now(), source="simulator" if self.adapter.is_simulated else "broker")
-                for p in positions
+                p.to_snapshot(self.journal.now(), source=source) for p in positions
             ]
             self.journal.save_position_snapshots(snapshots)
             unrealized = sum((p.unrealized_pl for p in positions), Decimal("0"))

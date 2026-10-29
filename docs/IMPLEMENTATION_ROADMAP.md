@@ -122,18 +122,24 @@ None of them should be merged into the running soak's code path mid-flight.
 
 The project is complete when all of the following are true:
 
-1. `pytest` is green. *(true today: 501 passed in `.venv`, 468 passed + 1 skipped
+1. `pytest` is green. *(true today: 510 passed in `.venv`, 477 passed + 1 skipped
    without `alpaca-py`)*
 2. `cryptobot preflight --mode paper` reports no failures against a real paper
-   account. *(not yet run)*
-3. A paper soak of at least 30 days has run with no critical reconciliation
-   drift and no unresolved orders left behind. *(not yet run)*
-4. `cryptobot acceptance --days 30` prints `ACCEPTED`, and the report's criteria
-   are all evidenced by the journal. *(not yet run)*
-5. `IMPLEMENTATION_CHECKLIST.md` records those results. *(pending 2–4)*
+   account. *(true today: 10 checks, 0 failures)*
+3. One order has been placed, filled, reconciled and reported end to end against
+   the real paper API. *(true today, once: 0.000248437 BTC, one fee, clean
+   reconciliation; a second order would be better evidence than one)*
+4. A paper soak of at least 30 days has run with no critical reconciliation
+   drift and no unresolved orders left behind. *(not started: it needs elapsed
+   time, and clock time cannot be compressed honestly)*
+5. `cryptobot acceptance --days 30` prints `ACCEPTED`, and the report's criteria
+   are all evidenced by the journal. *(blocked on 4)*
+6. `IMPLEMENTATION_CHECKLIST.md` records those results. *(done for 1–3,
+   pending 4–5)*
 
-Until then, the honest status is: **the platform is built and tested; it has not
-traded.**
+Until then, the honest status is: **the platform is built and tested, and has
+placed one real paper order. It has not soaked for 30 days and has never traded
+live.**
 
 ---
 
@@ -142,11 +148,11 @@ traded.**
 Before claiming any change is complete:
 
 ```powershell
-python -m pytest                                              # expect 501 passed
+python -m pytest                                              # expect 510 passed
 cryptobot config-check                                        # no secrets, paper only
 cryptobot env-hint                                            # variable names, never values
 cryptobot preflight --mode simulated                          # failures? warnings are fine
-cryptobot run-once                                            # decisions recorded, no orders
+cryptobot run-once --mode simulated                           # decisions recorded, no orders
 ```
 
 Then update `IMPLEMENTATION_CHECKLIST.md` with the actual output. A phase is not

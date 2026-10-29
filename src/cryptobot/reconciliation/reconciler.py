@@ -23,6 +23,7 @@ from decimal import Decimal
 from typing import Any, Callable, Mapping
 
 from cryptobot.core.contracts import OrderRecord, to_decimal
+from cryptobot.core.errors import ReconciliationError
 from cryptobot.core.logging import get_logger
 from cryptobot.core.states import Severity, SystemState
 from cryptobot.execution.base import ExecutionAdapter
@@ -69,6 +70,7 @@ class ReconciliationReport:
     halted: bool = False
     checked_orders: int = 0
     checked_positions: int = 0
+    source: str = ""
 
     @property
     def ok(self) -> bool:
@@ -79,13 +81,17 @@ class ReconciliationReport:
         return tuple(d for d in self.drifts if d.severity is Severity.CRITICAL)
 
     def summary(self) -> str:
+        # Naming the broker is not decoration: the same journal reconciled against
+        # a fresh simulator and against the broker produces opposite answers, and
+        # "clean" without a source was read as the wrong one more than once.
+        against = f" against {self.source}" if self.source else ""
         if self.ok:
             return (
-                f"reconciliation clean ({self.checked_orders} order(s), "
+                f"reconciliation clean{against} ({self.checked_orders} order(s), "
                 f"{self.checked_positions} position(s), {self.recovered} recovered)"
             )
         return (
-            f"reconciliation found {len(self.drifts)} drift(s) "
+            f"reconciliation found {len(self.drifts)} drift(s){against} "
             f"({len(self.critical)} critical); recovered={self.recovered} lost={self.lost} "
             f"pending={self.pending}" + ("; system HALTED" if self.halted else "")
         )
@@ -112,6 +118,7 @@ class Reconciler:
         self._clock = clock
 
     def reconcile(self, *, context: str = "periodic", halt_on_critical: bool = True) -> ReconciliationReport:
+        self._refuse_foreign_state()
         now = self._clock()
         drifts: list[Drift] = []
         recovered = lost = pending = 0
@@ -241,6 +248,34 @@ class Reconciler:
 
     # -- internals ----------------------------------------------------------
 
+    def _refuse_foreign_state(self) -> None:
+        """Refuse to compare a journal written by one broker against another.
+
+        A simulator starts flat and a funded paper account does not, so
+        reconciling one's journal against the other reports a position mismatch
+        that does not exist - and halts a healthy system. That happened: the
+        default ``--mode`` was ``simulated``, so the routine command reported
+        critical drift against the real account. Each position snapshot records
+        which adapter produced it, so the mistake is detectable *before* anything
+        is compared, and saying so beats a fabricated drift.
+        """
+        sources = {snapshot.source for snapshot in self._journal.latest_positions()}
+        if not sources:
+            return
+        # Snapshots written before the source column kept the adapter name use
+        # the words "broker" and "simulator". They still distinguish a real
+        # account from a simulator, which is the distinction that matters here.
+        ours = {self._adapter.name}
+        ours.add("simulator" if getattr(self._adapter, "is_simulated", False) else "broker")
+        foreign = sources - ours
+        if not foreign:
+            return
+        raise ReconciliationError(
+            f"refusing to reconcile: recorded positions came from "
+            f"{', '.join(sorted(foreign))} but this run asked "
+            f"{self._adapter.name}; pass the matching --mode"
+        )
+
     def _local_symbols(self) -> set[str]:
         return {position.symbol for position in self._journal.latest_positions()}
 
@@ -277,6 +312,7 @@ class Reconciler:
             halted=halted,
             checked_orders=checked_orders,
             checked_positions=checked_positions,
+            source=self._adapter.name,
         )
         if report.ok:
             self._journal.record_reconciliation("clean", Severity.INFO.value, {"context": context})

@@ -203,7 +203,7 @@ def test_run_once_analyses_without_submitting(tmp_path, capsys) -> None:
     assert _run("seed-demo --bars 400", config) == OK
     capsys.readouterr()
 
-    code = _run("run-once", config)
+    code = _run("run-once --mode simulated", config)
     output = capsys.readouterr().out
 
     assert code == OK
@@ -227,7 +227,7 @@ def test_run_once_refuses_when_the_system_is_halted(tmp_path, capsys) -> None:
     finally:
         journal.close()
 
-    code = _run("run-once", config)
+    code = _run("run-once --mode simulated", config)
 
     assert code == FAILED
     assert "preflight FAILED" in capsys.readouterr().out
@@ -318,7 +318,38 @@ def test_cancel_all_needs_yes_before_it_touches_an_order(tmp_path, capsys) -> No
 
 def test_reconcile_reports_a_clean_offline_state(tmp_path, capsys) -> None:
     assert _run("reconcile --mode simulated", _config(tmp_path)) == OK
-    assert "clean" in capsys.readouterr().out.lower()
+    output = capsys.readouterr().out.lower()
+    assert "clean" in output
+    assert "against" in output, "the summary names the broker it asked"
+
+
+def test_reconcile_asks_the_paper_broker_unless_told_otherwise(tmp_path, capsys) -> None:
+    """A fresh simulator holds nothing, so defaulting to it invents drift.
+
+    It used to: `reconcile` with no `--mode` compared a funded paper account
+    against an empty simulator, reported ``position_mismatch`` and halted the
+    journal. The default is the paper broker now, so without credentials the
+    failure is an honest ``broker_unavailable``.
+    """
+    config = _config(
+        tmp_path,
+        lambda raw: raw["alpaca"].update(
+            api_key_env="CRYPTOBOT_TEST_ABSENT_KEY",
+            api_secret_env="CRYPTOBOT_TEST_ABSENT_SECRET",
+        ),
+    )
+
+    assert _run("reconcile", config) == FAILED
+    capsys.readouterr()
+
+    journal = _journal(tmp_path)
+    try:
+        kinds = [row["kind"] for row in journal.recent_reconciliations(5)]
+    finally:
+        journal.close()
+
+    assert "broker_unavailable" in kinds
+    assert "position_mismatch" not in kinds, "it must not answer from a simulator"
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +478,7 @@ def test_acceptance_refuses_to_certify_an_empty_journal(tmp_path, capsys) -> Non
 def test_acceptance_says_how_long_is_left(tmp_path, capsys) -> None:
     config = _config(tmp_path)
     assert _run("seed-demo --bars 120", config) == OK
-    assert _run("run-once", config) == OK
+    assert _run("run-once --mode simulated", config) == OK
     capsys.readouterr()
 
     code = _run("acceptance --days 30 --min-trades 0 --min-decisions 1 --min-days 1", config)

@@ -248,7 +248,7 @@ class TradeReport:
             f"  closed trades    {self.count}" + (breakdown if self.count else ""),
             f"  net P&L          {self.net_pnl:+.4f} USD"
             f"  ({self.net_return_pct:+.2f}% of {self.ceiling} ceiling)",
-            f"  gross / fees     {self.gross_pnl:+.4f} / {self.fees_paid:.4f}",
+            f"  gross / fees     {self.gross_pnl:+.4f} / {self.fees_paid:.4f} (closed only)",
             f"  expectancy       {self.expectancy:+.4f} per trade",
             "  profit factor    "
             + ("n/a (no losses yet)" if factor is None else ("inf" if factor.is_infinite() else f"{factor:.2f}")),
@@ -259,10 +259,13 @@ class TradeReport:
             lines.append("  open positions")
             for position in self.open_positions:
                 mark = "unknown" if position.last_price is None else f"{position.last_price}"
+                unrealised = position.unrealised_pnl
+                shown = "n/a" if unrealised is None else f"{_round(unrealised):+.4f}"
                 lines.append(
                     f"    {position.symbol:<10}{position.quantity:>14} @ "
                     f"{position.average_price:.4f}  mark {mark}"
-                    f"  unrealised {position.unrealised_pnl if position.unrealised_pnl is not None else 'n/a'}"
+                    f"  fees {_round(position.fees):.4f}"
+                    f"  unrealised {shown}"
                 )
         if self.unbalanced:
             lines.append(f"  UNBALANCED       {len(self.unbalanced)} fill(s) could not be matched:")
@@ -424,7 +427,13 @@ def evaluate_trades(
 
 @dataclass(frozen=True)
 class ExecutionQuality:
-    """Filled price measured against the price the intent was built on."""
+    """Filled price measured against the price the intent was built on.
+
+    ``fees`` is valued in the quote currency even though the broker charges a
+    crypto fee on the *credited* asset: a buy's fee arrives denominated in the
+    base asset, and printing that number next to a USD-P&L line would read as
+    zero. See :meth:`FillRecord.fee_in_quote`.
+    """
 
     client_order_id: str
     symbol: str
@@ -490,7 +499,7 @@ class ExecutionReport:
             f"  filled orders    {self.count}",
             f"  average slippage {self.average_slippage_bps:+.2f} bps",
             f"  worst slippage   {self.worst_slippage_bps:+.2f} bps",
-            f"  fees             {self.fees:.4f}",
+            f"  fees (quote)     {self.fees:.4f}",
         ]
         for order in self.orders[:10]:
             lines.append(
@@ -543,7 +552,11 @@ def evaluate_execution(journal: Journal, *, limit: int = 500) -> ExecutionReport
         if reference is None:
             skipped.append(f"{order.client_order_id}: intent carries no usable price")
             continue
-        fees = sum((fill.fee for fill in journal.fills_for(order.client_order_id)), ZERO)
+        # ``fill.fee`` is in the charged asset, which for a buy is the base asset;
+        # the report is denominated in quote, so every fee is converted here.
+        fees = sum(
+            (fill.fee_in_quote() for fill in journal.fills_for(order.client_order_id)), ZERO
+        )
         quality.append(
             ExecutionQuality(
                 client_order_id=order.client_order_id,

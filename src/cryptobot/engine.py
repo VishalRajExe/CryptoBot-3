@@ -27,6 +27,7 @@ from cryptobot.core.contracts import (
     StrategySignal,
     to_decimal,
 )
+from cryptobot.core.errors import CryptobotError
 from cryptobot.core.logging import get_logger
 from cryptobot.core.states import Capabilities
 from cryptobot.data.alpaca_data import MarketDataService
@@ -110,9 +111,27 @@ class TradingEngine:
         return quantity
 
     def instrument(self, symbol: str):
+        """Instrument metadata, fetched once per symbol and remembered.
+
+        The journal is the cache; a miss asks the data service, which consults
+        ``/v2/assets`` and stores the result. Only when that is unavailable - no
+        credentials, simulated mode, or a broker error - does the documented
+        fallback apply, and it says so: sizing against constants the broker may
+        have changed is worth a warning.
+        """
         cached = self._journal.get_instrument(symbol)
         if cached is not None:
             return cached
+        try:
+            fetched = self._data.instrument(symbol)
+        except CryptobotError as exc:
+            log.warning(
+                "instrument metadata unavailable; using the documented fallback",
+                extra={"context": {"symbol": symbol, "error": str(exc)[:200]}},
+            )
+            fetched = None
+        if fetched is not None:
+            return fetched
         fallback = fallback_instrument(symbol)
         if fallback is not None:
             log.warning(

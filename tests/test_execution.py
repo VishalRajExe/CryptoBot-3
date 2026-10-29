@@ -29,6 +29,7 @@ from cryptobot.core.contracts import (
     OrderIntent,
     OrderStatus,
     OrderType,
+    PositionSnapshot,
     RiskVerdict,
     Side,
     TimeInForce,
@@ -40,6 +41,7 @@ from cryptobot.core.errors import (
     DuplicateOrderError,
     ExecutionError,
     PaperOnlyViolation,
+    ReconciliationError,
     RiskRejected,
 )
 from cryptobot.core.states import SystemState
@@ -673,6 +675,56 @@ def test_a_broker_outage_is_critical_and_fails_closed(
     assert "broker_unavailable" in {drift.kind for drift in report.drifts}
     assert report.halted is True
     assert journal.get_system_state()[0] is SystemState.HALTED
+
+
+def test_position_snapshots_remember_which_adapter_wrote_them(journal: Journal) -> None:
+    """The source column used to be a parameter defaulting to ``"broker"``."""
+    journal.save_position_snapshots(
+        [
+            PositionSnapshot(
+                ts=START,
+                symbol="BTC/USD",
+                quantity=Decimal("0.001"),
+                avg_entry_price=Decimal("20000"),
+                last_price=Decimal("20000"),
+                source="alpaca-paper",
+            )
+        ]
+    )
+
+    assert {position.source for position in journal.latest_positions()} == {"alpaca-paper"}
+
+
+def test_reconciling_against_a_different_broker_is_refused(
+    journal: Journal, ledger: AllocationLedger, clock: Clock
+):
+    """A simulator starts flat; comparing it with a funded account invents drift.
+
+    Regression: with ``--mode`` defaulting to simulated, the routine commands
+    compared a live paper position against an empty simulator, reported
+    ``position_mismatch`` and halted a healthy system.
+    """
+    journal.save_position_snapshots(
+        [
+            PositionSnapshot(
+                ts=START,
+                symbol="BTC/USD",
+                quantity=Decimal("0.001"),
+                avg_entry_price=Decimal("20000"),
+                last_price=Decimal("20000"),
+                source="alpaca-paper",
+            )
+        ]
+    )
+    adapter = FakeAdapter()
+    service = _service(journal, ledger, adapter, clock)
+
+    with pytest.raises(ReconciliationError) as caught:
+        _reconciler(journal, ledger, adapter, service, clock).reconcile()
+
+    assert "alpaca-paper" in str(caught.value)
+    assert "--mode" in str(caught.value)
+    assert journal.get_system_state()[0] is SystemState.ACTIVE, "a refusal is not a halt"
 
 
 def test_reconciliation_can_run_without_halting_for_observation(
