@@ -279,8 +279,8 @@ tests are driven through a fake transport instead.
 **Objective:** after a crash, the bot knows exactly what it had, what it
 submitted, and what it still does not know.
 
-**Status:** `COMPLETED AND VERIFIED` (against the simulator and the mocked
-adapter)
+**Status:** `COMPLETED AND VERIFIED` (against the simulator, the mocked adapter,
+and the real paper account)
 
 | | |
 | --- | --- |
@@ -288,7 +288,7 @@ adapter)
 | Dependencies | Phases 1, 5 |
 | Tests | `tests/test_execution.py` (recovery), `tests/test_system.py` (loop + reconcile cadence), `tests/test_ledger_stress.py` (restart with orphaned reservations) |
 | Acceptance | an `UNCERTAIN` order is resolved by client order id, never by resubmission; an order unresolved past `execution.lost_order_grace_seconds` becomes `LOST`; drift is recorded with a severity and a critical drift halts entries; account balances and position snapshots are stored as evidence |
-| Evidence | `pytest tests/test_execution.py tests/test_system.py` green; `cryptobot reconcile --mode simulated` reports a clean state on a fresh journal |
+| Evidence | `pytest tests/test_execution.py tests/test_system.py` green; `cryptobot reconcile --mode simulated` reports a clean state on a fresh journal; on the authenticated paper account `cryptobot reconcile` (which defaults to `paper`) reported `reconciliation clean against alpaca-paper (0 order(s), 1 position(s), 0 recovered)` |
 
 Reconciliation compares, in order: order resolution, position quantity per
 symbol, `committed` against the broker's reported cost basis, open broker orders
